@@ -7,7 +7,7 @@ The charger is designed to be compatible with the [OpenNerve Implantable Pulse G
 2. Attach J-Link EDU Mini USB cable to Windows computer and in Device Manager confirm that J-Link driver is under USB devices (If it is not there, start J-Link Configurator, right-click on J‐Link EDU Mini, Update FW > Configure > select WinUSB driver > OK)
 3. Attach Tag-Connect cable to the charger PCB, open the J-Flash Lite, confirm that Target device is NRF52, and click OK.
 4. Click Erase Chip to remove previous FW.
-5. Extract 2 hex files from the attached ZIP file
+5. Download the two hex files from the Firmware folder.
 6. Flash the SoftDevice:
     * Click the “…” button and select 140_nrf52_7.2.0_softdevice.hex 
     * Click Program Device
