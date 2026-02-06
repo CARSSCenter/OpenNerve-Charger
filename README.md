@@ -9,11 +9,11 @@ The charger is designed to be compatible with the [OpenNerve Implantable Pulse G
 4. Click Erase Chip to remove previous FW.
 5. Extract 2 hex files from the attached ZIP file
 6. Flash the SoftDevice:
-    a. Click the “…” button and select 140_nrf52_7.2.0_softdevice.hex 
-    b. Click Program Device
+    * a. Click the “…” button and select 140_nrf52_7.2.0_softdevice.hex 
+    * b. Click Program Device
 7. Flash the application:
-    a. Click the “…” button and select wpt-charger.hex 
-    b. Click Program Device
+    * a. Click the “…” button and select wpt-charger.hex 
+    * b. Click Program Device
 
 ## Disclaimer
 The contents of this repository are subject to revision. No representation or warranty, express or implied, is provided in relation to the accuracy, correctness, completeness, or reliability of the information, opinions, or conclusions expressed in this repository.
