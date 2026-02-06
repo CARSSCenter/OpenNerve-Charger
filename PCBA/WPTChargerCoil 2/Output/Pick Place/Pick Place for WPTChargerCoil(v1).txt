@@ -1,0 +1,17 @@
+Altium Designer Pick and Place Locations
+C:\Focus_Workspace\Medipace\medipace-hardware-development\WPTChargerMultiboard\WPTChargerCoil\Output\Pick Place\Pick Place for WPTChargerCoil(v1).txt
+
+========================================================================================================================
+File Design Information:
+
+Date:       20/08/24
+Time:       15:32
+Revision:   3a1d144d9b23b8223c8dec37aa1ff20c2d2d55d3
+Variant:    v1
+Units used: mm
+
+Designator Layer    Center-X(mm) Center-Y(mm) Rotation 
+NTC200     TopLayer 66.1670      74.9300      180      
+L200       TopLayer 59.6900      86.3600      0        
+J201       TopLayer 59.4360      72.5175      180      
+J200       TopLayer 59.5630      99.4405      0        

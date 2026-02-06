@@ -1,0 +1,14 @@
+Project Outputs Generation Report
+---------------------------------
+Start Output Generation At 2:40:26 PM On 8/28/2024
+
+Output: Netlist
+Type  : Test Points
+From  : Variant [WPTChargerMain] of PCB Document [WPTChargerMain.PcbDoc]
+   Generated File[Netlist_IPC-D-356A.ipc]
+
+
+Files Generated   : 1
+Documents Printed : 0
+
+Finished Output Generation At 2:40:26 PM On 8/28/2024

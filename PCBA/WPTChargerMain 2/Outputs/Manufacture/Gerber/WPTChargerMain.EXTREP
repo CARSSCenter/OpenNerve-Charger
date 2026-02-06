@@ -1,0 +1,23 @@
+------------------------------------------------------------------------------------------
+Gerber File Extension Report For: WPTChargerMain.GBR   8/28/2024  2:41:00 PM
+------------------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------------------
+Layer Extension     Layer Description                      
+------------------------------------------------------------------------------------------
+.gbr                Top Overlay                             
+.gbr                Top Paste                               
+.gbr                Top Solder                              
+.gbr                Top                                     
+.gbr                GND                                     
+.gbr                Power                                   
+.gbr                Bottom                                  
+.gbr                Bottom Solder                           
+.gbr                Bottom Paste                            
+.gbr                Bottom Overlay                          
+.gbr                Board Shape                             
+.gbr                Top Pad Master                          
+.gbr                Bottom Pad Master                       
+.gbr                Profile                                 
+------------------------------------------------------------------------------------------

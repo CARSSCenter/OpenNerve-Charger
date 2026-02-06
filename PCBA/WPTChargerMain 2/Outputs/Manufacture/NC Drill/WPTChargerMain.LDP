@@ -1,0 +1,5 @@
+Layer Pairs Export File for PCB: C:\Focus_Workspace\Medipace\medipace-hardware-development\WPTChargerMultiboard\WPTChargerMain\WPTChargerMain.PcbDoc
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=wptchargermain-roundholes.txt|DrillLayers=gtl,g1,g2,gbl
+LayersSetName=Top_Bot_Slot_Holes|DrillFile=wptchargermain-slotholes.txt|DrillLayers=gtl,g1,g2,gbl
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=wptchargermain-roundholes.tx4|DrillLayers=gtl,g1,g2,gbl
+LayersSetName=Top_Bot_Slot_Holes|DrillFile=wptchargermain-slotholes.tx4|DrillLayers=gtl,g1,g2,gbl

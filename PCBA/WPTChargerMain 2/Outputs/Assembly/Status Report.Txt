@@ -1,0 +1,10 @@
+Output: Bill of Materials
+Type  : BOM
+From  : Variant [WPTChargerMain] of Project [WPTChargerMain.PrjPcb]
+   Generated File[Bill of Materials-BOM(WPTChargerMain).xlsx]
+
+
+Files Generated   : 1
+Documents Printed : 0
+
+Finished Output Generation At 2:41:21 PM On 8/28/2024

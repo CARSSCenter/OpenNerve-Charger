@@ -1,0 +1,3 @@
+Layer Pairs Export File for PCB: C:\Focus_Workspace\Medipace\medipace-hardware-development\WPTChargerMultiboard\WPTChargerCoil\WPTChargerCoil.PcbDoc
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=wptchargercoil.txt|DrillLayers=gtl,gbl
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=wptchargercoil.tx4|DrillLayers=gtl,gbl

@@ -1,0 +1,14 @@
+Project Outputs Generation Report
+---------------------------------
+Start Output Generation At 2:39:01 PM On 8/28/2024
+
+Output: Test Point Report
+Type  : Test Points
+From  : Variant [WPTChargerMain] of PCB Document [WPTChargerMain.PcbDoc]
+   Generated File[Assembly Testpoint Report for WPTChargerMain.csv]
+
+
+Files Generated   : 1
+Documents Printed : 0
+
+Finished Output Generation At 2:39:01 PM On 8/28/2024

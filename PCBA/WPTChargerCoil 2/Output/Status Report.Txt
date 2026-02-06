@@ -1,0 +1,10 @@
+Output: Bill of Materials
+Type  : BOM
+From  : Variant [v1] of Project [WPTChargerCoil.PrjPcb]
+   Generated File[Bill of Materials-BOM(v1).xlsx]
+
+
+Files Generated   : 1
+Documents Printed : 0
+
+Finished Output Generation At 3:32:52 PM On 8/20/2024

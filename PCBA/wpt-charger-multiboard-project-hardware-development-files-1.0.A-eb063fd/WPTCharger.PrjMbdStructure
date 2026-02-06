@@ -1,0 +1,4 @@
+Record=DiagramHierarchy|SourceDocument=WPTCharger-Multiboard SchematicMbsDoc.MbsDoc|Kind=Multi-board Schematic Module|Designator=PCB2|Source=..\WPTChargerCoil\WPTChargerCoil.PrjPcb
+Record=SubProject|SourceDocument=WPTCharger-Multiboard SchematicMbsDoc.MbsDoc|ProjectPath=..\WPTChargerCoil\WPTChargerCoil.PrjPcb
+Record=DiagramHierarchy|SourceDocument=WPTCharger-Multiboard SchematicMbsDoc.MbsDoc|Kind=Multi-board Schematic Module|Designator=PCB1|Source=..\WPTChargerMain\WPTChargerMain.PrjPcb
+Record=SubProject|SourceDocument=WPTCharger-Multiboard SchematicMbsDoc.MbsDoc|ProjectPath=..\WPTChargerMain\WPTChargerMain.PrjPcb

@@ -1,0 +1,33 @@
+----------------------------------------------------------------------------------------------------------------------------------
+NCDrill File Report For: WPTChargerMain.PcbDoc   8/28/2024  2:40:59 PM
+----------------------------------------------------------------------------------------------------------------------------------
+
+Layer Pair : Top to Bottom
+ASCII RoundHoles File : WPTChargerMain-RoundHoles.TXT
+ASCII SlotHoles File : WPTChargerMain-SlotHoles.TXT
+
+Tool       Hole Size               Hole Tolerance               Hole Type       Hole Count   Plated         Tool Travel
+----------------------------------------------------------------------------------------------------------------------------------
+T1      0.2mm (8mil)                                              Round             577       PTH        1397.18mm (55.01inch)
+T2      0.6mm (24mil)                                             Slot              4         PTH        44.35mm (1.75inch)
+T3      0.711mm (28mil)                                           Round             3         PTH        8.67mm (0.34inch)
+T4      1.02mm (40mil)                                            Round             10        PTH        216.16mm (8.51inch)
+T5      0.991mm (39mil)                                           Round             3         NPTH       9.72mm (0.38inch)
+T6      2.3mm (91mil)                                             Round             4         NPTH       134.00mm (5.28inch)
+----------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              601
+----------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              601
+CounterHole : Counterholes Bottom
+ASCII RoundHoles File : WPTChargerMain-RoundHoles.TX4
+ASCII SlotHoles File : WPTChargerMain-SlotHoles.TX4
+
+Tool       Hole Size               Hole Tolerance               Hole Type       Hole Count   Plated         Tool Travel              Depth          Angle
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+T7      4.4mm (173mil)                                            Round             4         NPTH       134.00mm (5.28inch)     2.2mm (86.614mil)    90°
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              4
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+CounterHole Totals                                                                  4
+
+Total Processing Time (hh:mm:ss) : 00:00:00
