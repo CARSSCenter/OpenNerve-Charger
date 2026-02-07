@@ -2,7 +2,7 @@
 This repository holds the PCBA files, firmware, and design files for the OpenNerve charger.
 The charger is designed to be compatible with the [OpenNerve Implantable Pulse Generator](https://github.com/CARSSCenter/OpenNerve-Implantable-Pulse-Generator) and to inductively charge it at 300kHz.
 
-## Insttructions for Use
+## Instructions for Use
 BTNs behavior 
 Regarding the button functionalities:
 
