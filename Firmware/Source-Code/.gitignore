@@ -75,3 +75,6 @@ Thumbs.db
 **/build/
 venv
 *.csv
+
+# Private keys
+fw_update_tools/priv.pem
