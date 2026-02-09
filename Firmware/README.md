@@ -1,4 +1,4 @@
-<img src="OpenNerve_logo.png" width="800" height="200">
+<img src="Source-Code/OpenNerve_logo.png" width="800" height="200">
 
 # WPT Charger Embedded Software Development
 
