@@ -1,0 +1,16 @@
+; This is an example.
+; Erase '.example' from this file extension.
+; Set your absolute paths for the Onsemi IDE.
+; Set your absolute path for the Workspace Folder and JLINK executable.
+; Set your absolute path for the cppcheck executable.
+[segger]
+SEGGER_PATH = "C:\Program Files\SEGGER\SEGGER Embedded Studio 8.10c"
+
+[workspace]
+SEGGER_IDE_WORKSPACE_PATH  = "C:\FMD\hornet-wpt\src\project\project"
+
+[jlink]
+JLINK_EXE_PATH = "C:\Program Files\SEGGER\JLink"
+
+[cppcheck]
+CPP_CHECK_EXECUTABLE_PATH = "C:\Program Files\Cppcheck\"

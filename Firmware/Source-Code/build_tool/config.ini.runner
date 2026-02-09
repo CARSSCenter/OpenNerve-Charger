@@ -1,0 +1,13 @@
+; This is the config.ini file that the runner would use to execute the scripts.
+
+[onsemi]
+SEGGER_PATH = "C:\Program Files\SEGGER\SEGGER Embedded Studio 8.10c"
+
+[workspace]
+SEGGER_IDE_WORKSPACE_PATH  = "C:\FMD\hornet-wpt\src\project\project"
+
+[jlink]
+JLINK_EXE_PATH = "C:\Program Files\SEGGER\JLink"
+
+[cppcheck]
+CPP_CHECK_EXECUTABLE_PATH = "C:\Program Files\Cppcheck\"

@@ -1,0 +1,113 @@
+/**
+ * @name Hornet / WPT Charger
+ * @file hal_pinout.h
+ * @brief Pinout Hardware Abstraction Layer for nrf52840
+ *
+ * @copyright Copyright (c) 2024
+ *
+ */
+
+#ifndef HAL_PINOUT_H
+#define HAL_PINOUT_H
+
+#include "../project/config.h"
+
+#include "nrf_gpio.h"
+
+#if BOARD == PCBA
+
+#define PIN_nRESET
+
+// UART
+#define PIN_UART_RX NRF_GPIO_PIN_MAP(0, 24)
+#define PIN_UART_TX NRF_GPIO_PIN_MAP(0, 23)
+
+// SPI
+#define PIN_SCLK NRF_GPIO_PIN_MAP(1, 9)
+#define PIN_MOSI NRF_GPIO_PIN_MAP(1, 8)
+#define PIN_MISO NRF_GPIO_PIN_MAP(0, 8)
+#define PIN_DAC_CS NRF_GPIO_PIN_MAP(0, 11)
+
+// Battery
+#define PIN_CHG_EN NRF_GPIO_PIN_MAP(0, 9)
+#define PIN_CHG_PPR NRF_GPIO_PIN_MAP(0, 21)
+#define PIN_CHG_CHG NRF_GPIO_PIN_MAP(0, 22)
+#define PIN_CHG_FAST NRF_GPIO_PIN_MAP(0, 10)
+#define PIN_CHG_ISET NRF_GPIO_PIN_MAP(0, 2)
+#define PIN_BAT_MEAS NRF_SAADC_INPUT_AIN4
+
+// PMC
+#define PIN_PMC_VCC_EN NRF_GPIO_PIN_MAP(0, 20)
+
+// WPT IC Signals
+#define PIN_WPT_NTC NRF_SAADC_INPUT_AIN6
+#define PIN_WPT_IMON NRF_SAADC_INPUT_AIN5
+#define PIN_WPT_STAT NRF_GPIO_PIN_MAP(0, 7)
+#define PIN_WPT_EN NRF_GPIO_PIN_MAP(1, 15)
+#define PIN_WPT_CTD NRF_GPIO_PIN_MAP(0, 5)
+
+// DAC
+#define PIN_DAC_LDAC NRF_GPIO_PIN_MAP(0, 12)
+
+// Buttons
+#define PIN_BUTTON1 NRF_GPIO_PIN_MAP(0, 19)
+#define PIN_BUTTON2 NRF_GPIO_PIN_MAP(0, 17)
+#define PIN_BUTTON3 NRF_GPIO_PIN_MAP(0, 13)
+
+// LED 1
+#define PIN_LEDS NRF_GPIO_PIN_MAP(0, 14)
+
+// Buzzer
+#define PIN_BUZZER NRF_GPIO_PIN_MAP(0, 4)
+
+#endif // BOARD == PCBA
+
+#if BOARD == DEV_KIT
+ 
+#define PIN_nRESET
+
+// UART
+#define PIN_UART_RX NRF_GPIO_PIN_MAP(0, 27)
+#define PIN_UART_TX NRF_GPIO_PIN_MAP(1, 1)
+
+// SPI
+#define PIN_SCLK NRF_GPIO_PIN_MAP(1, 15)
+#define PIN_MOSI NRF_GPIO_PIN_MAP(1, 13)
+#define PIN_MISO NRF_GPIO_PIN_MAP(1, 14)
+#define PIN_DAC_CS NRF_GPIO_PIN_MAP(1, 12)
+
+// Battery
+#define PIN_CHG_EN NRF_GPIO_PIN_MAP(0, 23)
+#define PIN_CHG_PPR NRF_GPIO_PIN_MAP(0, 24)
+#define PIN_CHG_CHG NRF_GPIO_PIN_MAP(0, 25)
+#define PIN_CHG_FAST NRF_GPIO_PIN_MAP(0, 26)
+#define PIN_CHG_ISET NRF_GPIO_PIN_MAP(0, 06)
+#define PIN_BAT_MEAS NRF_SAADC_INPUT_AIN4
+
+// PMC
+#define PIN_PMC_VCC_EN NRF_GPIO_PIN_MAP(0, 19)
+
+// WPT IC Signals
+#define PIN_WPT_NTC NRF_GPIO_PIN_MAP(0, 29)
+#define PIN_WPT_IMON NRF_GPIO_PIN_MAP(0, 31)
+#define PIN_WPT_STAT NRF_GPIO_PIN_MAP(0, 20)
+#define PIN_WPT_EN NRF_GPIO_PIN_MAP(0, 28)
+
+// DAC
+#define PIN_DAC_LDAC NRF_GPIO_PIN_MAP(0, 17)
+#define PIN_DAC_REF NRF_GPIO_PIN_MAP(0, 30)
+
+// Buttons
+#define PIN_BUTTON1 NRF_GPIO_PIN_MAP(0, 11)
+#define PIN_BUTTON2 NRF_GPIO_PIN_MAP(1, 12)
+#define PIN_BUTTON3 NRF_GPIO_PIN_MAP(1, 24)
+
+// LED 1
+#define PIN_LEDS NRF_GPIO_PIN_MAP(0, 4) //Works on devkit
+
+// Buzzer
+#define PIN_BUZZER NRF_GPIO_PIN_MAP(0, 14)
+
+#endif // BOARD == DEV_KIT
+
+#endif // PINOUT_H

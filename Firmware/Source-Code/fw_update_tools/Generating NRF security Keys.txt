@@ -1,0 +1,17 @@
+Create security keys for bootloader
+   > nrfutil keys generate D:\Focus_Workspace\Hornet\Code\dfu_images\priv.pem
+
+   > nrfutil keys display --key sk --format hex D:\Focus_Workspace\Hornet\Code\dfu_images\priv.pem
+
+   > nrfutil keys display --key pk --format hex D:\Focus_Workspace\Hornet\Code\dfu_images\priv.pem
+
+   > nrfutil keys display --key pk --format code D:\Focus_Workspace\Hornet\Code\dfu_images\priv.pem
+
+   > nrfutil keys display --key pk --format code D:\Focus_Workspace\Hornet\Code\dfu_images\priv.pem --out_file public_key.c
+
+
+Packet creation
+   > nrfutil.exe pkg generate --hw-version 52 --application-version 1 --application hornet-wpt-charger_Debug_v1.hex --sd-req 0x100 --key-file priv.pem v1_hornet_mi.zip
+
+Send FW
+   > nrfutil dfu serial -pkg v1_hornet_mi.zip -p COM17 -b 115200 -fc 0   (-fc 0 means flow ocntrol disabled)
