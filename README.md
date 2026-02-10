@@ -10,6 +10,7 @@ Regarding the button functionalities:
     BTN2 does not trigger any action in the current firmware.
     BTN3 enables DFU mode and resets the device to boot in DFU mode.
 
+DFU mode allows firmware updates over USB-C.
 
 LEDs behavior
 The left LED shows the current state:
