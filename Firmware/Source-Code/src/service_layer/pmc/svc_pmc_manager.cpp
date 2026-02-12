@@ -26,7 +26,7 @@ namespace svc
     }
 
     void PmcManager::ConfigureGpios()
-    {
+    {  
         LOG_DEBUG("PMC Manager: ConfigGpios\n");
         hal::Gpio::gpio_config_t vccEnablePinConfig = {
             .pin_number = mVccEnablePin,
@@ -41,7 +41,7 @@ namespace svc
 
         hal::Gpio::gpio_config_t ChgEnablePinConfig = {
             .pin_number = mChgEnablePin,
-            .direction = hal::Gpio::gpio_pin_dir_t::NRF_GPIO_PIN_DIR_INPUT,
+            .direction = hal::Gpio::gpio_pin_dir_t::NRF_GPIO_PIN_DIR_OUTPUT,
             .input = hal::Gpio::gpio_pin_input_t::NRF_GPIO_PIN_INPUT_DISCONNECT,
             .pull = hal::Gpio::gpio_pin_pull_t::NRF_GPIO_PIN_NOPULL,
             .drive = hal::Gpio::gpio_pin_drive_t::NRF_GPIO_PIN_S0S1,
