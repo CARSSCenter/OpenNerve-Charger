@@ -134,11 +134,12 @@ namespace svc
 
     void BleManager::ParseManufacturerSpecificData(uint8_t *adv_data, uint16_t adv_data_len, uint16_t index)
     {
-        // Check if this is the manufacturer-specific data with Company ID 0xFFFF
+        // Check if this is the manufacturer-specific data with Company ID 0xFFFF or 0xF0F0
         uint16_t company_id = adv_data[index + 2] | (adv_data[index + 3] << 8);
 
         if (company_id == CARSS_COMPANY_ID)
         {
+        /*
             mAdvertisementData.chargingStatusParameters.GET_VRECT_DET = adv_data[index + 4];
             mAdvertisementData.chargingStatusParameters.GET_VRECT_OVP = adv_data[index + 5];
             mAdvertisementData.chargingStatusParameters.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD = adv_data[index + 6];
@@ -151,6 +152,45 @@ namespace svc
             mAdvertisementData.chargingStatusParameters.GET_THERM_OFST = adv_data[index + 15] | (adv_data[index + 16] << 8);
             mAdvertisementData.chargingStatusParameters.BATTERY_VOLTAGE_MEASURED = adv_data[index + 17] | (adv_data[index + 18] << 8) | (adv_data[index + 19] << 16) | (adv_data[index + 20] << 24);
             mAdvertisementData.chargingStatusParameters.GET_TEST_INFO = adv_data[index + 21] | (adv_data[index + 22] << 8) | (adv_data[index + 23] << 16);
+          */
+            
+            //New code test
+
+              // IPG MSD layout after company ID (index+4 = msd[0]):
+              //   [0] DVDD (×100mV)   [1] BattA (×100mV)  [2] BattB (×100mV)
+              //   [3] ImpA (×10mV)    [4] ImpB (×10mV)
+              //   [5] ThermRef (×10mV) [6] ThermOut (×10mV) [7] ThermOfst (×10mV)
+              //   [8] GPIO bits 0-7   [9] GPIO bits 8-13   [10-22] zeros  [23] HW version
+              //
+              // GPIO byte (msd[8]) bit assignments:
+              //   0: VRECT_DETn (active-low)   1: VRECT_OVPn (active-low)
+              //   2: VCHG_PGOOD                3: CHG1_STATUS (0=charging, 1=charged)
+              //   4: CHG1_OVP_ERRn (active-low) 5: CHG2_STATUS
+              //   6: CHG2_OVP_ERRn (active-low) 7: ENG2_SDNn
+              uint8_t gpio0 = adv_data[index + 12]; // msd[8]
+
+              mAdvertisementData.chargingStatusParameters.GET_VRECT_DET                           = (gpio0 >> 0) & 0x01;
+              mAdvertisementData.chargingStatusParameters.GET_VRECT_OVP                           = (gpio0 >> 1) & 0x01;
+              mAdvertisementData.chargingStatusParameters.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD = (gpio0 >> 2) & 0x01;
+              mAdvertisementData.chargingStatusParameters.GET_CHG1_STATUS                         = (gpio0 >> 3) & 0x01;
+              mAdvertisementData.chargingStatusParameters.GET_CHG1_OVP_ERR                        = (gpio0 >> 4) & 0x01;
+              mAdvertisementData.chargingStatusParameters.GET_CHG2_STATUS                         = (gpio0 >> 5) & 0x01;
+              mAdvertisementData.chargingStatusParameters.GET_CHG2_OVP_ERR                        = (gpio0 >> 6) & 0x01;
+
+              // Thermistor bytes are uint8 in 10 mV units; multiply by 10 to give mV for CalculateTemperatureFromBle()
+              mAdvertisementData.chargingStatusParameters.GET_THERM_REF  = (uint16_t)adv_data[index +  9] * 10;
+              mAdvertisementData.chargingStatusParameters.GET_THERM_OUT  = (uint16_t)adv_data[index + 10] * 10;
+              mAdvertisementData.chargingStatusParameters.GET_THERM_OFST = (uint16_t)adv_data[index + 11] * 10;
+
+              // BattA (msd[1]) in lower 16 bits, BattB (msd[2]) in upper 16 bits, both converted to mV
+              mAdvertisementData.chargingStatusParameters.BATTERY_VOLTAGE_MEASURED =
+                  ((uint32_t)adv_data[index + 5] * 100) |
+                  ((uint32_t)(adv_data[index + 6] * 100) << 16);
+
+              mAdvertisementData.chargingStatusParameters.GET_TEST_INFO = 0; // not present in current IPG MSD format
+
+            // End code test
+            
 
             uint32_t optDataAddress = reinterpret_cast<uint32_t>(&mAdvertisementData);
 

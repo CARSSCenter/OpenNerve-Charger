@@ -27,7 +27,7 @@
 #define APP_BLE_CONN_CFG_TAG 1
 
 // The CARSS_COMPANY_ID on the IPG is 0xF0F0 for production firmware, 0xFFFF for DVT firmware
-#define CARSS_COMPANY_ID 0xFFFF
+#define CARSS_COMPANY_ID 0xF0F0
 
 namespace svc
 {
