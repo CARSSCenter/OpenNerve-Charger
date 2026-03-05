@@ -58,7 +58,9 @@ STATE: CHARGE (Yellow Left LED ON / middle LED Green when complete)
 In summary, after the charger is connected and initialization finishes, the device enters the WAIT state. If BTN1 is pressed, the device enters SCAN mode and the left LED turns blue. If a device is found, the charger transitions to CHARGE and the left LED turns yellow. If no device is found, the charger enters SLOW_CHARGE_AND_SCAN and the left LED turns white. If the device is still not found after that period, the system returns to WAIT (all LEDs off).
 If a device is found during slow scan, the system transitions to CHARGE. Once charging is completed, the middle LED turns green and the system returns to WAIT. During charging, if BTN1 is pressed, the device returns to the WAIT state.
 
-## Instructions for Flashing Firmware
+## Instructions for Firmware Development and Flashing
+Instructions on how to set up the development environment and compile firmware can be found in the firmware folder's [readme](Firmware/README.md).
+### To flash:
 1. Install J-Link software: https://www.segger.com/downloads/jlink (when installing, check the box to install legacy USB Driver)
 2. Attach J-Link EDU Mini USB cable to Windows computer and in Device Manager confirm that J-Link driver is under USB devices (If it is not there, start J-Link Configurator, right-click on J‐Link EDU Mini, Update FW > Configure > select WinUSB driver > OK)
 3. Attach Tag-Connect cable to the charger PCB, open the J-Flash Lite, confirm that Target device is NRF52, and click OK.
