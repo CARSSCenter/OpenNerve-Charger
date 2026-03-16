@@ -29,9 +29,16 @@ namespace app
     {
         svc::PmcSubSystem& mPmcSubSystem = svc::PmcSubSystem::Instance();
         mPmcSubSystem.mPmcPort.SendEvent(svc::PmcPort::Event_e::PMC_POWER_ON, NULL);
-        // Call WPT IC Service methods to start charge
         LOG_INFO("Charge State: PMC power on\n");
         hal::Leds::GetInstance().LedCharging(true);
+
+        // Ensure WPT is active regardless of which state we transitioned from.
+        // From SlowChargeAndScan: WPT service is in StateSlowCharge or StateCharging (WPT already
+        // enabled at minimum power). WPT_POWER_ON transitions StateSlowCharge -> StateCharging.
+        // From Scan: WPT service is already in StateCharging, WPT_POWER_ON is a no-op there.
+        svc::WptSubsystem &mWptSubsystem = svc::WptSubsystem::Instance();
+        mWptSubsystem.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_POWER_ON, NULL);
+        mWptManager.StartIpgTemperaturePgoodMonitoringTimer();
     }
 
     void StateCharge::DispatchEvent(uint32_t eventId, uint32_t optDataAddress)
@@ -53,7 +60,16 @@ namespace app
             stateMachine->ChangeState(states->pStateWait);
             break;
         case SystemPort::Event_e::BLE_SCAN_TIMEOUT:
-            stateMachine->ChangeState(states->pStateWait);
+        {
+            // The BLE scan timer fires 10 s after the last IPG advertisement. If the IPG reduces
+            // its advertising rate once it detects wireless power, this timeout would otherwise
+            // kick the charger out of StateCharge and disable WPT. Instead, restart scanning so
+            // the PGOOD link is re-established when the IPG advertises again.
+            // The BLE SM is already in StateIdle (StateScanning::Exit called StopScanning on
+            // the timeout); START_SCANNING transitions it back to StateScanning.
+            svc::BleSubsystem &mBleSubsystem = svc::BleSubsystem::Instance();
+            mBleSubsystem.mBlePort.SendEvent(svc::BlePort::Event_e::START_SCANNING, NULL);
+        }
             break;
         case SystemPort::Event_e::WPT_SCAN_TIMEOUT:
             stateMachine->ChangeState(states->pStateWait);

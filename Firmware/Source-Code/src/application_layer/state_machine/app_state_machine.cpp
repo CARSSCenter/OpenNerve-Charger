@@ -81,15 +81,38 @@ namespace app
         LOG_INFO("  VDDS Supply Enable: %d", (ChargingStatusParameters.GET_TEST_INFO & 0xFF00) >> 8);
         LOG_INFO("  VDDA Supply Enable: %d", (ChargingStatusParameters.GET_TEST_INFO & 0xFF0000) >> 16);
 
-        if (ChargingStatusParameters.GET_CHG1_STATUS == 0)
+        // Determine charging completion robustly across one or two batteries.
+        //
+        // CHG1_STATUS and CHG2_STATUS each report 0=actively charging, 1=idle/full.
+        // The idle/full value (1) appears both when the charger IC has finished AND when
+        // it has not yet received enough input power to start — so a CHG=1 reading alone
+        // cannot be used to conclude "battery full."
+        //
+        // VCHG_PGOOD (1 = charging rail power-good) is used as a qualifier: if it is low
+        // the charger ICs are not yet running and any CHG=1 readings are meaningless.
+        //
+        // Rules:
+        //   - Any CHG = 0                 → at least one battery is actively charging.
+        //   - All CHG = 1  AND  PGOOD = 1 → all charging is complete.
+        //   - All CHG = 1  AND  PGOOD = 0 → charger ICs not yet powered up; treat as
+        //                                    charging-in-progress to keep WPT enabled.
+        //
+        // This is intentionally robust: if one battery is full (CHG=1) and the other is
+        // still charging (CHG=0), the "any CHG=0" branch keeps WPT running. The full
+        // battery's charger IC will self-limit current; no intervention needed here.
+
+        const bool chg1_charging = (ChargingStatusParameters.GET_CHG1_STATUS == 0);
+        const bool chg2_charging = (ChargingStatusParameters.GET_CHG2_STATUS == 0);
+        const bool pgood         = (ChargingStatusParameters.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD == 1);
+        const bool all_done      = !chg1_charging && !chg2_charging;
+
+        if (all_done && pgood)
         {
-            // IPG Battery Charging
-            svc::WptSubsystem &pWptSubsystem = svc::WptSubsystem::Instance();
-            pWptSubsystem.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_BATTERY_CHARGING, optDataAddress);
-        }
-        else if (ChargingStatusParameters.GET_CHG1_STATUS == 1)
-        {
-            // IPG Battery Charged
+            // All battery chargers complete and charging supply confirmed good.
+            LOG_INFO("StateMachine: All batteries charged (CHG1=%d CHG2=%d PGOOD=%d)",
+                     ChargingStatusParameters.GET_CHG1_STATUS,
+                     ChargingStatusParameters.GET_CHG2_STATUS,
+                     pgood);
             svc::WptSubsystem &pWptSubsystem = svc::WptSubsystem::Instance();
             pWptSubsystem.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_BATTERY_CHARGED, optDataAddress);
 
@@ -97,6 +120,16 @@ namespace app
             pBleSubsystem.mBlePort.SendEvent(svc::BlePort::Event_e::STOP_SCANNING, optDataAddress);
 
             pSystem->mSystemPort.SendEvent(SystemPort::Event_e::BATTERY_CHARGED, optDataAddress);
+        }
+        else
+        {
+            // At least one battery is still charging, or charger ICs not yet powered up.
+            LOG_INFO("StateMachine: Charging in progress (CHG1=%d CHG2=%d PGOOD=%d)",
+                     ChargingStatusParameters.GET_CHG1_STATUS,
+                     ChargingStatusParameters.GET_CHG2_STATUS,
+                     pgood);
+            svc::WptSubsystem &pWptSubsystem = svc::WptSubsystem::Instance();
+            pWptSubsystem.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_BATTERY_CHARGING, optDataAddress);
         }
     }
 

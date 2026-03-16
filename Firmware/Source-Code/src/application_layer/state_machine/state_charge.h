@@ -11,6 +11,7 @@
 #define STATE_CHARGE_H
 
 #include "../../core_layer/event_driven_architecture/state_machine/eda_state_machine.h"
+#include "svc_wpt_manager.h"
 
 namespace app
 {
@@ -23,6 +24,9 @@ namespace app
         void Entry();
         void DispatchEvent(uint32_t eventId, uint32_t optDataAddress);
         void Exit();
+
+    private:
+        svc::WptManager &mWptManager = svc::WptManager::Instance();
     };
 
 }

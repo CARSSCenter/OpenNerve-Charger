@@ -44,18 +44,25 @@ namespace app
             svc::BleSubsystem &mBleSubsystem = svc::BleSubsystem::Instance();
             mBleSubsystem.mBlePort.SendEvent(svc::BlePort::Event_e::STOP_SCANNING, NULL);
 
-            mWptManager.StopIpgTemperaturePgoodMonitoringTimer();        
+            mWptManager.StopIpgTemperaturePgoodMonitoringTimer();
+            svc::WptSubsystem &mWptSubsystemBle = svc::WptSubsystem::Instance();
+            mWptSubsystemBle.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_POWER_OFF, NULL);
             stateMachine->ChangeState(states->pStateWait);
         }
         break;
         case SystemPort::Event_e::BLE_DEVICE_FOUND:
         {
+            // WPT stays enabled — do not send WPT_POWER_OFF here.
+            // StateCharge::Entry() will send WPT_POWER_ON to ensure the service
+            // layer is active regardless of which path led here.
             mWptManager.StartIpgTemperaturePgoodMonitoringTimer();
             stateMachine->ChangeState(states->pStateCharge);
         }
         break;
         case SystemPort::Event_e::WPT_SCAN_TIMEOUT:
         {
+            svc::WptSubsystem &mWptSubsystemWpt = svc::WptSubsystem::Instance();
+            mWptSubsystemWpt.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_POWER_OFF, NULL);
             stateMachine->ChangeState(states->pStateWait);
         }
         break;
@@ -71,14 +78,11 @@ namespace app
     }
 
     void StateSlowChargeAndScan::Exit()
-    {   
-        
-        svc::WptSubsystem &mWptSubsystem = svc::WptSubsystem::Instance();
-        mWptSubsystem.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_POWER_OFF, NULL);
+    {
+        // WPT_POWER_OFF is sent explicitly in BLE_SCAN_TIMEOUT and WPT_SCAN_TIMEOUT
+        // dispatch cases, not here. On BLE_DEVICE_FOUND the WPT stays enabled so
+        // StateCharge can take over without an enable/disable/enable round-trip.
         hal::Leds::GetInstance().LedChargingSlow(false);
-
-        // Call WPT IC Service methods to stop slow charge
-        // Call BLE methods to stop scanning
     }
 
 }

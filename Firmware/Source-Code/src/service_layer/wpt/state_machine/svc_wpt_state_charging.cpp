@@ -82,10 +82,25 @@ namespace svc
             LOG_DEBUG("WPT State Machine: Battery Charging\n");
             break;
         }
+        case WptPort::Event_e::WPT_SLOW_CHARGE:
+        {
+            // Clamp PTH1/PTH2 to minimum power (400mV, step 0) during slow charge mode.
+            // The LTC4125 continues its internal search cycles but its weak drive (~5-40uA)
+            // is overridden by the low-impedance DAC, holding pulse width at minimum.
+            LOG_DEBUG("WPT State Machine Charging state: WPT Slow Charge - setting minimum power\n");
+            mWptManager.AdjustWptPowerTransfer(0);
+            break;
+        }
         case WptPort::Event_e::WPT_BATTERY_CHARGED:
         {
-            LOG_DEBUG("WPT State Machine: Battery Charged\n");
-            WptPort::SendEvent(WptPort::Event_e::WPT_POWER_OFF, NULL);
+            // Do NOT send WPT_POWER_OFF here. Battery-full is handled by the application
+            // layer: ProcessNewBleData (CHG1==1) sends BATTERY_CHARGED to the system port,
+            // which causes StateCharge::Exit() -> WPT_POWER_OFF through the proper path.
+            // Sending WPT_POWER_OFF directly from the WPT SM races with the white->yellow
+            // transition: multiple DEVICE_FOUND callbacks can fire while STOP_SCANNING is
+            // still queued, causing a second WPT_BATTERY_CHARGED to disable WPT after
+            // StateCharge::Entry() has already re-enabled it via WPT_POWER_ON.
+            LOG_DEBUG("WPT State Machine: Battery Charged (WPT shutdown via app layer)\n");
             break;
         }
         case WptPort::Event_e::WPT_SCAN_TIMEOUT:
