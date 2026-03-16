@@ -13,6 +13,7 @@
 #include "app_state_machine.h"
 #include "hal_dfu.h"
 #include "hal_led.h"
+#include "svc_ble_manager.h"
 #include "svc_ble_subsystem.h"
 #include "svc_wpt_subsystem.h"
 
@@ -22,6 +23,10 @@ namespace app
 
     void StateSlowChargeAndScan::Entry()
     {
+        // Use a longer scan timeout so the IPG has time to power up, initialize,
+        // and start advertising after the wireless power wakes it from off state.
+        svc::BleManager::SetScanTimeout(SCAN_TIMEOUT_SLOW_CHARGE_MS);
+
         svc::BleSubsystem &mBleSubsystem = svc::BleSubsystem::Instance();
         mBleSubsystem.mBlePort.SendEvent(svc::BlePort::Event_e::START_SCANNING, NULL);
 
@@ -82,6 +87,10 @@ namespace app
         // WPT_POWER_OFF is sent explicitly in BLE_SCAN_TIMEOUT and WPT_SCAN_TIMEOUT
         // dispatch cases, not here. On BLE_DEVICE_FOUND the WPT stays enabled so
         // StateCharge can take over without an enable/disable/enable round-trip.
+
+        // Restore the default scan timeout for all other states.
+        svc::BleManager::SetScanTimeout(SCAN_TIMEOUT_MS);
+
         hal::Leds::GetInstance().LedChargingSlow(false);
     }
 

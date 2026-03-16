@@ -19,7 +19,8 @@
 #define SCAN_WINDOW 0x0050
 
 #define TIMER_NAME "BleTimeoutTimer"
-#define SCAN_TIMEOUT_MS 10000 //Changed from original value of 2000
+#define SCAN_TIMEOUT_MS 10000            // Blue-light (StateScan) and StateCharge timeout
+#define SCAN_TIMEOUT_SLOW_CHARGE_MS 30000 // White-light (StateSlowChargeAndScan) timeout
 #define PERIODIC 1
 #define ONESHOT 0
 
@@ -84,6 +85,10 @@ namespace svc
         /// Stop BLE Scanning
         static void StopScanning(void);
 
+        /// Set the scan timeout used by the software watchdog timer.
+        /// Call before StartScanning() or between advertisement events to take effect.
+        static void SetScanTimeout(uint32_t timeoutMs);
+
         // Getter for advertisement data
         static const AdvertisementData_t& GetAdvertisementData() 
         {
@@ -96,6 +101,8 @@ namespace svc
         static AdvertisementData_t mAdvertisementData;
 
         static eda::Timer mTimeoutTimer;
+
+        static uint32_t mScanTimeoutMs;
 
         /// Start the timeout timer
         static void StartTimeoutTimer(void);

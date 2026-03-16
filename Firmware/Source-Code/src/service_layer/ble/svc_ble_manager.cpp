@@ -20,6 +20,8 @@ namespace svc
 
     eda::Timer BleManager::mTimeoutTimer(TIMER_NAME, SCAN_TIMEOUT_MS, ONESHOT, TimerCallback);
 
+    uint32_t BleManager::mScanTimeoutMs = SCAN_TIMEOUT_MS;
+
     BleManager::BleManager(void)
     {
     }
@@ -44,10 +46,15 @@ namespace svc
         StopTimeoutTimer();
     }
 
+    void BleManager::SetScanTimeout(uint32_t timeoutMs)
+    {
+        mScanTimeoutMs = timeoutMs;
+    }
+
     void BleManager::StartTimeoutTimer(void)
     {
         LOG_DEBUG("Starting timeout timer.");
-        mTimeoutTimer.Start();
+        mTimeoutTimer.Start(mScanTimeoutMs);
     }
 
     void BleManager::StopTimeoutTimer(void)
@@ -196,8 +203,8 @@ namespace svc
 
             BlePort::SendEventFromISR(BlePort::Event_e::DEVICE_FOUND, optDataAddress);
 
-            // Restart the timer when the Device is found
-            mTimeoutTimer.StartFromISR();
+            // Restart the timer when the Device is found, using the current timeout period
+            mTimeoutTimer.StartFromISR(mScanTimeoutMs);
         }
     }
 
