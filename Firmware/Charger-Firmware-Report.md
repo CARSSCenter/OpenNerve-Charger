@@ -1,7 +1,7 @@
 # WPT Charger — Firmware Implementation Report
 
 **Hardware:** Hornet WPT Charger PCBA
-**MCU:** nRF52810 (via nRF5 SDK)
+**MCU:** nRF52840 (via nRF5 SDK)
 **Repo path:** `Firmware/Source-Code/`
 
 ---
@@ -205,21 +205,24 @@ Entry:
   BleManager::SetScanTimeout(30000)     ← 30 s window for IPG boot time
   BlePort::START_SCANNING
   WptPort::WPT_SLOW_CHARGE              ← LTC4125 at minimum power
+  PmcPort::PMC_POWER_ON                 ← VCC_EN high (5V rail for LTC4125)
   hal::Leds::LedChargingSlow(true)      ← white LED
 
 DispatchEvent:
   BLE_DEVICE_FOUND:
     mWptManager.StartIpgTemperaturePgoodMonitoringTimer()
-    → ChangeState(StateCharge)          ← WPT stays enabled
+    → ChangeState(StateCharge)          ← WPT and VCC stay enabled
 
   BLE_SCAN_TIMEOUT:
     BlePort::STOP_SCANNING
     mWptManager.StopIpgTemperaturePgoodMonitoringTimer()
     WptPort::WPT_POWER_OFF
+    PmcPort::PMC_POWER_OFF              ← VCC_EN low
     → ChangeState(StateWait)
 
   WPT_SCAN_TIMEOUT:
     WptPort::WPT_POWER_OFF
+    PmcPort::PMC_POWER_OFF              ← VCC_EN low
     → ChangeState(StateWait)
 
   BUTTON_DFU_PRESSED:
@@ -230,7 +233,9 @@ Exit:
   hal::Leds::LedChargingSlow(false)
 ```
 
-**Key design decision — WPT state on BLE_DEVICE_FOUND:** When the IPG is detected, WPT is left enabled intentionally. `StateCharge::Entry()` sends `WPT_POWER_ON` to ensure the WPT service is in `StateCharging` regardless of which path led here. This avoids the unnecessary disable/enable round-trip that would briefly cut power to the still-booting IPG.
+**Key design decisions on BLE_DEVICE_FOUND:** When the IPG is detected, WPT and VCC are left enabled intentionally. `StateCharge::Entry()` sends `WPT_POWER_ON` to ensure the WPT service is in `StateCharging` regardless of which path led here, and `PMC_POWER_ON` is a no-op in `PmcStateEnable` (PMC was already enabled in this state's `Entry()`). This avoids any disable/enable round-trip that would briefly cut power to the still-booting IPG.
+
+**Why PMC_POWER_ON is needed in this state:** `PIN_PMC_VCC_EN` (P0.20) controls the 5V supply rail that powers the LTC4125. Without it, the LTC4125 has no supply and cannot transmit power even if `WPT_EN` is asserted. Since `StateSlowChargeAndScan` is specifically for charging a fully-discharged IPG (no BLE yet), VCC must be enabled here, not deferred to `StateCharge`.
 
 ### 4.6 StateCharge
 
@@ -484,7 +489,7 @@ The LTC4065 charger ICs in the IPG handle their own charge termination (C/10 cut
 |------|-------------------|
 | `src/application_layer/state_machine/state_charge.h` | Added `#include "svc_wpt_manager.h"` and `WptManager &mWptManager` private member |
 | `src/application_layer/state_machine/state_charge.cpp` | `Entry()` now unconditionally sends `WPT_POWER_ON` and calls `StartIpgTemperaturePgoodMonitoringTimer()`; `BLE_SCAN_TIMEOUT` restarts scanning instead of exiting the state |
-| `src/application_layer/state_machine/state_slow_charge_and_scan.cpp` | Scan timeout changed to `SCAN_TIMEOUT_SLOW_CHARGE_MS` (30 s); `WPT_POWER_OFF` not sent on `BLE_DEVICE_FOUND` (WPT left enabled for `StateCharge::Entry()` to take over); PGOOD monitoring timer started on device found |
+| `src/application_layer/state_machine/state_slow_charge_and_scan.cpp` | Scan timeout changed to `SCAN_TIMEOUT_SLOW_CHARGE_MS` (30 s); `WPT_POWER_OFF` not sent on `BLE_DEVICE_FOUND` (WPT left enabled for `StateCharge::Entry()` to take over); PGOOD monitoring timer started on device found; `PMC_POWER_ON` added to `Entry()` to enable 5V VCC rail; `PMC_POWER_OFF` added to `BLE_SCAN_TIMEOUT` and `WPT_SCAN_TIMEOUT` cases |
 | `src/service_layer/ble/svc_ble_manager.h` | `SCAN_TIMEOUT_MS` changed from 2,000 to 10,000 ms; `SCAN_TIMEOUT_SLOW_CHARGE_MS` (30,000 ms) added; `CARSS_COMPANY_ID` changed from `0xFFFF` to `0xF0F0` |
 | `src/service_layer/ble/svc_ble_manager.cpp` | Advertisement parser updated to new IPG MSD format (thermistors as uint8 × 10 mV, GPIO bits packed in single byte, battery voltages from msd[1]/msd[2]) |
 | `src/service_layer/wpt/state_machine/svc_wpt_state_charging.cpp` | `WPT_SLOW_CHARGE` case added (clamps DAC to step 0); `WPT_BATTERY_CHARGED` made a deliberate no-op (shutdown routed through app layer to avoid race) |
@@ -553,11 +558,11 @@ WPT powers IPG; IPG boots (~10–20 s), starts advertising
   → BleManager receives advertisement
   → BlePort::DEVICE_FOUND
   → App SM: StateSlowChargeAndScan → StateCharge
-      WPT left enabled (no WPT_POWER_OFF sent)
+      WPT and VCC left enabled (no WPT_POWER_OFF or PMC_POWER_OFF sent)
   → StateSlowChargeAndScan::Exit():
       SetScanTimeout(10 s), white LED off
   → StateCharge::Entry():
-      PMC_POWER_ON, yellow LED
+      PMC_POWER_ON (no-op — PMC already in PmcStateEnable), yellow LED
       WptPort::WPT_POWER_ON       ← transitions WPT SM from any state to StateCharging
       StartIpgTemperaturePgoodMonitoringTimer()
 

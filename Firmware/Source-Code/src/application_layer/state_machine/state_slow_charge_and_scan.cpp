@@ -15,6 +15,8 @@
 #include "hal_led.h"
 #include "svc_ble_manager.h"
 #include "svc_ble_subsystem.h"
+#include "svc_pmc_port.h"
+#include "svc_pmc_subsystem.h"
 #include "svc_wpt_subsystem.h"
 
 namespace app
@@ -32,6 +34,9 @@ namespace app
 
         svc::WptSubsystem &mWptSubsystem = svc::WptSubsystem::Instance();
         mWptSubsystem.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_SLOW_CHARGE, NULL);
+
+        svc::PmcSubSystem &mPmcSubSystem = svc::PmcSubSystem::Instance();
+        mPmcSubSystem.mPmcPort.SendEvent(svc::PmcPort::Event_e::PMC_POWER_ON, NULL);
 
         hal::Leds::GetInstance().LedChargingSlow(true);
     }
@@ -52,6 +57,10 @@ namespace app
             mWptManager.StopIpgTemperaturePgoodMonitoringTimer();
             svc::WptSubsystem &mWptSubsystemBle = svc::WptSubsystem::Instance();
             mWptSubsystemBle.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_POWER_OFF, NULL);
+
+            svc::PmcSubSystem &mPmcSubSystemBle = svc::PmcSubSystem::Instance();
+            mPmcSubSystemBle.mPmcPort.SendEvent(svc::PmcPort::Event_e::PMC_POWER_OFF, NULL);
+
             stateMachine->ChangeState(states->pStateWait);
         }
         break;
@@ -68,6 +77,10 @@ namespace app
         {
             svc::WptSubsystem &mWptSubsystemWpt = svc::WptSubsystem::Instance();
             mWptSubsystemWpt.mWptPort.SendEvent(svc::WptPort::Event_e::WPT_POWER_OFF, NULL);
+
+            svc::PmcSubSystem &mPmcSubSystemWpt = svc::PmcSubSystem::Instance();
+            mPmcSubSystemWpt.mPmcPort.SendEvent(svc::PmcPort::Event_e::PMC_POWER_OFF, NULL);
+
             stateMachine->ChangeState(states->pStateWait);
         }
         break;
