@@ -76,7 +76,7 @@ namespace svc
         // The following code is commented out because the CTD pin is not implemented in the prototype
 
         // Configure WPT CTD Pin
-        /* static constexpr hal::Gpio::gpio_config_t gpioCtdConfig = {
+         static constexpr hal::Gpio::gpio_config_t gpioCtdConfig = {
             .pin_number = PIN_WPT_CTD,
             .direction = hal::Gpio::gpio_pin_dir_t::NRF_GPIO_PIN_DIR_OUTPUT,
             .input = hal::Gpio::gpio_pin_input_t::NRF_GPIO_PIN_INPUT_DISCONNECT,
@@ -85,7 +85,7 @@ namespace svc
             .sense = hal::Gpio::gpio_pin_sense_t::NRF_GPIO_PIN_NOSENSE};
 
         hal::Gpio::ConfigurePin(gpioCtdConfig);
-        hal::Gpio::Write(PIN_WPT_CTD, 0); */
+        hal::Gpio::Write(PIN_WPT_CTD, 1); 
 
         // Configure WPT STAT Pin
         static constexpr hal::Gpio::gpio_config_t gpioStatConfig = {
