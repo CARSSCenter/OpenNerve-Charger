@@ -91,6 +91,9 @@ namespace app
 
         /// Callback for the DFU Button Press event
         static void DfuButtonCallback();
+
+        /// Callback for the Reset Button Press event — performs an immediate MCU reset
+        static void ResetButtonCallback();
     };
 }
 

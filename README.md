@@ -7,7 +7,7 @@ BTNs behavior
 Regarding the button functionalities:
 
     BTN1 changes the state from WAIT to SCAN. If pressed during CHARGE state, it interrupts charging and returns to WAIT.
-    BTN2 does not trigger any action in the current firmware.
+    BTN2 performs an immediate MCU reset from any state. Use this to recover from a firmware hang without disconnecting power.
     BTN3 enables DFU mode and resets the device to boot in DFU mode.
 
 DFU mode allows firmware updates over USB-C.
@@ -26,37 +26,47 @@ Below is a more detailed summary of the firmware state machine, main transitions
 
 States: INITIALIZATION, WAIT, SCAN, SLOW_CHARGE_AND_SCAN, CHARGE
 
-STATE: INITIALIZATION (initializes all modules)
+Note: BTN2 (MCU reset) is available in all states and bypasses the state machine entirely. Pressing BTN2 disables WPT and the VCC regulator, then immediately resets the MCU. The device boots back to WAIT.
 
-    INIT_DONE → WAIT
+STATE: INITIALIZATION (initializes BLE, WPT, and PMC subsystems)
+
+    BLE_INITIALIZED → WAIT
+    BTN2 PRESSED → MCU RESET
     BUTTON_DFU_PRESSED (BTN3) → DFU mode
 
 STATE: WAIT
 
     BTN1 PRESSED → SCAN
-    BTN3 PRESSED→ DFU mode
+    BTN2 PRESSED → MCU RESET
+    BTN3 PRESSED → DFU mode
 
 STATE: SCAN (Blue Left LED ON)
 
     BLE_DEVICE_FOUND → CHARGE
     BLE_SCAN_TIMEOUT → SLOW_CHARGE_AND_SCAN
-    BTN3 PRESSED→ DFU mode
+    BTN2 PRESSED → MCU RESET
+    BTN3 PRESSED → DFU mode
 
 STATE: SLOW_CHARGE_AND_SCAN (White Left LED ON)
 
     BLE_DEVICE_FOUND → CHARGE
     BLE_SCAN_TIMEOUT → WAIT
     WPT_SCAN_TIMEOUT → WAIT
-    BTN3 PRESSED→ DFU mode
+    BTN2 PRESSED → MCU RESET
+    BTN3 PRESSED → DFU mode
 
 STATE: CHARGE (Yellow Left LED ON / middle LED Green when complete)
 
     CHARGE_COMPLETE → WAIT (middle LED Green ON)
     BTN1 PRESSED → WAIT (stop charge)
+    WPT_SCAN_TIMEOUT → WAIT
+    TEMPERATURE_CRITICAL (IPG ≥ 41°C) → WAIT (thermal protection)
+    BTN2 PRESSED → MCU RESET
     BUTTON_DFU_PRESSED (BTN3) → DFU mode
 
 In summary, after the charger is connected and initialization finishes, the device enters the WAIT state. If BTN1 is pressed, the device enters SCAN mode and the left LED turns blue. If a device is found, the charger transitions to CHARGE and the left LED turns yellow. If no device is found, the charger enters SLOW_CHARGE_AND_SCAN and the left LED turns white. If the device is still not found after that period, the system returns to WAIT (all LEDs off).
-If a device is found during slow scan, the system transitions to CHARGE. Once charging is completed, the middle LED turns green and the system returns to WAIT. During charging, if BTN1 is pressed, the device returns to the WAIT state.
+If a device is found during slow scan, the system transitions to CHARGE. Once charging is completed, the middle LED turns green and the system returns to WAIT. During charging, if BTN1 is pressed, the device returns to the WAIT state. Charging also stops automatically if the IPG temperature exceeds 41°C (thermal protection) or if the WPT status times out.
+If the firmware becomes unresponsive at any point, BTN2 can be used to reset the MCU and return to WAIT without disconnecting power.
 
 ## Instructions for Firmware Development and Flashing
 Instructions on how to set up the development environment and compile firmware can be found in the firmware folder's [readme](Firmware/README.md).

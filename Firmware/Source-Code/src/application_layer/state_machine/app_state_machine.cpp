@@ -11,6 +11,8 @@
 
 #include "app_system.h"
 #include "hal_button.h"
+#include "hal_gpio.h"
+#include "hal_pinout.h"
 #include "hal_led.h"
 #include "svc_ble_subsystem.h"
 #include "svc_wpt_subsystem.h"
@@ -32,6 +34,7 @@ namespace app
         hal::Button::Init();
         static hal::Button onOffButton(PIN_BUTTON1, &OnOffButtonCallback, nullptr);
         static hal::Button DfuButton(PIN_BUTTON3, &DfuButtonCallback, nullptr);
+        static hal::Button resetButton(PIN_BUTTON2, &ResetButtonCallback, nullptr);
 
         hal::Leds::Initialize();
         hal::Leds& leds = hal::Leds::GetInstance();
@@ -207,6 +210,17 @@ namespace app
     {
         System *pSystem = &System::GetInstance();
         pSystem->mSystemPort.SendEventFromISR(SystemPort::Event_e::BUTTON_DFU_PRESSED, NULL);
+    }
+
+    // Reset Button Callback — called from GPIOTE ISR, does not depend on FreeRTOS
+
+    void SystemStateMachine::ResetButtonCallback()
+    {
+        // Disable active hardware before GPIO pins go high-Z on reset.
+        // hal::Gpio::Write wraps nrf_gpio_pin_write, which is safe from ISR context.
+        hal::Gpio::Write(PIN_WPT_EN, 1);     // Disable LTC4125 (active LOW)
+        hal::Gpio::Write(PIN_PMC_VCC_EN, 0); // Disable VCC regulator (active HIGH)
+        NVIC_SystemReset();
     }
 
 }
