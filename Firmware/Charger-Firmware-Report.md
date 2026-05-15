@@ -42,7 +42,7 @@ DAC voltage = 400 mV + (step × 100 mV)    step ∈ [0, 12]
 
 | Signal | Pin | Direction | Notes |
 |--------|-----|-----------|-------|
-| `WPT_EN` | P1.15 | Output | HIGH = LTC4125 enabled |
+| `WPT_EN` | P1.15 | Output | LOW = LTC4125 enabled (active-low) |
 | `WPT_STAT` | P0.7 | Input | LTC4125 load-detection status |
 | `WPT_NTC` | AIN6 | Analog | Local NTC thermistor on charger PCB |
 | `WPT_IMON` | AIN5 | Analog | Coil current monitor |
@@ -103,7 +103,6 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
 | `BLE_DEVICE_FOUND` | IPG advertisement received |
 | `BLE_SCAN_TIMEOUT` | No advertisement within scan window |
 | `WPT_SCAN_TIMEOUT` | WPT-level scan timed out |
-| `BATTERY_CHARGING` | At least one battery still charging |
 | `BATTERY_CHARGED` | All batteries full |
 | `BUTTON_PRESSED` | User pressed the power button |
 | `BUTTON_DFU_PRESSED` | DFU mode button combo |
@@ -177,7 +176,7 @@ Idle state. No LEDs, no scanning, no WPT. Transitions to `StateScan` on `BUTTON_
 ```
 Entry:
   BlePort::START_SCANNING
-  hal::Leds::LedScanning(true)     ← blue LED
+  hal::Leds::LedScanOn(true)       ← blue LED
 
 DispatchEvent:
   BLE_DEVICE_FOUND:
@@ -193,7 +192,8 @@ DispatchEvent:
     hal::Dfu::start_dfu_mode()
 
 Exit:
-  hal::Leds::LedScanning(false)
+  WptPort::WPT_POWER_ON            ← transitions WPT SM StateIdle → StateCharging
+  hal::Leds::LedScanOn(false)
 ```
 
 When no IPG is found within the 10-second scan window, the charger assumes the IPG may be powered off. It enters `StateSlowChargeAndScan`, enabling WPT at minimum power so the IPG can boot from wireless power, then scans for another 30 seconds to catch the BLE advertisement after initialization.
@@ -377,14 +377,15 @@ StateTest (not implemented)
 `WptManager` is the singleton that owns the LTC4125 and DAC directly.
 
 **`EnableWpt()`:**
-1. Sets `WPT_EN` HIGH
-2. Sets DAC CHANNEL_1 to step 0 (400 mV)
+1. Sets `WPT_EN` LOW (active-low: enables LTC4125)
+2. Starts the 5-second status timeout timer
 3. Starts the status monitoring timer (500 ms periodic)
 
 **`DisableWpt()`:**
-1. Sets DAC CHANNEL_1 to 0 V
-2. Sets `WPT_EN` LOW
-3. Stops the status monitoring timer
+1. Sets `WPT_EN` HIGH (active-low: disables LTC4125)
+2. Stops the status monitoring timer
+3. Resets the PGOOD state machine
+4. Stops the IPG temperature/PGOOD monitoring timer
 
 **`AdjustWptPowerTransfer(step)`:**
 Calls `SetPulseWidthThresholdStep(step)`, which writes:
@@ -446,7 +447,7 @@ When the IPG reports all batteries full (`CHG1_STATUS = 1` AND `CHG2_STATUS = 1`
 | 20°C | 126,400 Ω |
 | 25°C | 100,000 Ω |
 | 30°C | 79,590 Ω |
-| 40°C | 51,290 Ω |
+| 40°C | 51,320 Ω |
 | 50°C | 33,790 Ω |
 
 **Thermal actions:**
@@ -519,14 +520,13 @@ IPG advertisement received (company ID 0xF0F0)
   → BleManager::ParseManufacturerSpecificData()
   → BlePort::DEVICE_FOUND (from ISR)
   → App SM: StateScan → StateCharge
-  → StateScan::Exit(): blue LED off
+  → StateScan::Exit(): WptPort::WPT_POWER_ON (WPT SM: StateIdle → StateCharging), blue LED off
   → StateCharge::Entry():
       PmcPort::PMC_POWER_ON
       yellow LED on
-      WptPort::WPT_POWER_ON
+      WptPort::WPT_POWER_ON (no-op — WPT SM already in StateCharging)
       mWptManager.StartIpgTemperaturePgoodMonitoringTimer()
-  → WPT SM: StateIdle → StateCharging
-  → StateCharging::Entry(): mWptManager.EnableWpt() (DAC step 0, WPT_EN high)
+  → StateCharging::Entry(): mWptManager.EnableWpt() (WPT_EN LOW, starts status timers)
 
 Every 2 s: IpgPgoodMonitoring() + IpgTemperatureMonitoring()
   → PGOOD=0: increment DAC step, send WptPort::WPT_ADJUST_POWER
