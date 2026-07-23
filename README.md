@@ -65,7 +65,7 @@ STATE: CHARGE (Yellow Left LED ON / middle LED Green when complete)
     BUTTON_DFU_PRESSED (BTN3) → DFU mode
 
 In summary, after the charger is connected and initialization finishes, the device enters the WAIT state. If BTN1 is pressed, the device enters SCAN mode and the left LED turns blue. If a device is found, the charger transitions to CHARGE and the left LED turns yellow. If no device is found, the charger enters SLOW_CHARGE_AND_SCAN and the left LED turns white. If the device is still not found after that period, the system returns to WAIT (all LEDs off).
-If a device is found during slow scan, the system transitions to CHARGE. Once charging is completed, the middle LED turns green and the system returns to WAIT. During charging, if BTN1 is pressed, the device returns to the WAIT state. Charging also stops automatically if the IPG temperature exceeds 41°C (thermal protection) or if the WPT status times out.
+If a device is found during the slow scan, the system transitions to CHARGE. Once charging is completed, the middle LED turns green and the system returns to WAIT. During charging, if BTN1 is pressed, the device returns to the WAIT state. Charging also stops automatically if the IPG temperature rise above 41°C (thermal protection) or if the WPT status times out.
 If the firmware becomes unresponsive at any point, BTN2 can be used to reset the MCU and return to WAIT without disconnecting power.
 
 ## Instructions for Firmware Development and Flashing
