@@ -12,7 +12,7 @@ Regarding the button functionalities:
 
 DFU mode allows firmware updates over USB-C.
 
-LEDs behavior
+LED behavior
 The left LED shows the current state:
 
     OFF → WAIT
