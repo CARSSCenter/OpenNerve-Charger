@@ -9,11 +9,9 @@
 
 #include "svc_wpt_manager.h"
 
-#include "app_system.h"
 #include "eda_manager_log_config.h"
 #include "hal_dac.h"
 #include "svc_ble_subsystem.h"
-#include "svc_wpt_subsystem.h"
 
 namespace svc
 {
@@ -114,6 +112,19 @@ namespace svc
         ResetPgoodMonitoringStateMachine();
         StopIpgTemperaturePgoodMonitoringTimer();
         LOG_DEBUG("WPT Manager: DisableWpt\n");
+    }
+
+    void WptManager::PauseWptForThermal()
+    {
+        WptHalInstance.Disable();
+        LOG_WARNING("WPT Manager: PauseWptForThermal - coil output disabled, monitoring continues\n");
+    }
+
+    void WptManager::ResumeWptFromThermal()
+    {
+        WptHalInstance.Enable();
+        ResetPgoodMonitoringStateMachine();
+        LOG_INFO("WPT Manager: ResumeWptFromThermal - coil output re-enabled\n");
     }
 
     void WptManager::StopWptScan()
@@ -247,9 +258,6 @@ namespace svc
 
     void WptManager::IpgTemperatureMonitoring(void)
     {
-        app::System *pSystem = &app::System::GetInstance();
-        WptSubsystem &pWptSubsystem = svc::WptSubsystem::Instance();
-
         const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
         svc::ChargingStatusParameters_t ChargingStatusParameters = advData.chargingStatusParameters;
 
@@ -257,54 +265,29 @@ namespace svc
 
         LOG_INFO("WPT Manager: IPG Temperature %d C\n", ipg_temperature);
 
-        // Check if temperature exceeds high threshold
-        if (ipg_temperature >= IPG_TEMP_THRESHOLD_HIGH)
+        // Single hysteresis band: pause at/above PAUSE, resume at/below RESUME.
+        // Between the two thresholds, hold the current state.
+        if (ipg_temperature >= IPG_TEMP_THRESHOLD_PAUSE)
         {
-            LOG_ERROR("WPT Manager: Critical IPG temperature detected %d.%02d C",
-                      (int32_t)ipg_temperature,
-                      (int32_t)((ipg_temperature) * 100) % 100);
-
-            // Check if temperature exceeds high threshold
-            LOG_ERROR("WPT Manager: Extremely critical temperature detected, Stop power transfer");
-            pSystem->mSystemPort.SendEventFromISR(app::SystemPort::Event_e::TURN_OFF, NULL);
-            m_is_high_temperature_threshold_exceeded = true;
-        }
-        // Check if temperature exceeds medium threshold
-        // LOG_WARNING for medium threshold breach
-        else if (ipg_temperature >= IPG_TEMP_THRESHOLD_MEDIUM && ipg_temperature < IPG_TEMP_THRESHOLD_HIGH)
-        {
-            LOG_WARNING("WPT Manager: IPG Temperature warning %d.%02d C exceeds medium threshold (%d C)",
-                        (int32_t)ipg_temperature,
-                        (int32_t)((ipg_temperature) * 100) % 100,
-                        IPG_TEMP_THRESHOLD_MEDIUM);
-
             if (!m_is_high_temperature_threshold_exceeded)
             {
-                LOG_ERROR("WPT Manager: Critical temperature detected , Pause power transfer");
-                WptPort::SendEventFromISR(WptPort::Event_e::WPT_POWER_OFF, NULL);
+                LOG_ERROR("WPT Manager: IPG temperature %d.%02d C reached pause threshold (%d C), pausing power transfer",
+                          (int32_t)ipg_temperature,
+                          (int32_t)((ipg_temperature) * 100) % 100,
+                          IPG_TEMP_THRESHOLD_PAUSE);
+                WptPort::SendEventFromISR(WptPort::Event_e::WPT_THERMAL_PAUSE, NULL);
                 m_is_high_temperature_threshold_exceeded = true;
             }
         }
-        // LOG_INFO for low threshold
-        else if (ipg_temperature > IPG_TEMP_THRESHOLD_LOW && ipg_temperature < IPG_TEMP_THRESHOLD_MEDIUM)
+        else if (ipg_temperature <= IPG_TEMP_THRESHOLD_RESUME)
         {
-            LOG_INFO("WPT Manager: IPG Temperature is above the low threshold (%d C) %d.%02d C.",
-                     IPG_TEMP_THRESHOLD_LOW,
-                     (int32_t)ipg_temperature,
-                     (int32_t)((ipg_temperature) * 100) % 100);
-        }
-        // We're in high temperature state, check if we can return to normal
-        // Only switch back when temperature drops below high threshold
-        else //(ipg_temperature <= low_threshold)
-        {
-            LOG_INFO("WPT Manager: IPG Temperature is under the low threshold (%d C) %d.%02d C.",
-                     IPG_TEMP_THRESHOLD_LOW,
-                     (int32_t)ipg_temperature,
-                     (int32_t)((ipg_temperature) * 100) % 100);
             if (m_is_high_temperature_threshold_exceeded)
             {
-                LOG_INFO("WPT Manager: IPG Temperature returned to safe level, Resume power transfer");
-                WptPort::SendEventFromISR(WptPort::Event_e::WPT_POWER_ON, NULL);
+                LOG_INFO("WPT Manager: IPG temperature %d.%02d C reached resume threshold (%d C), resuming power transfer",
+                         (int32_t)ipg_temperature,
+                         (int32_t)((ipg_temperature) * 100) % 100,
+                         IPG_TEMP_THRESHOLD_RESUME);
+                WptPort::SendEventFromISR(WptPort::Event_e::WPT_THERMAL_RESUME, NULL);
                 m_is_high_temperature_threshold_exceeded = false;
             }
         }

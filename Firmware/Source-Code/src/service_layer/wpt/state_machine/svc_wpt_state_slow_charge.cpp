@@ -82,6 +82,18 @@ namespace svc
             WptPort::SendEvent(WptPort::Event_e::WPT_POWER_OFF, NULL);
             break;
         }
+        case WptPort::Event_e::WPT_THERMAL_PAUSE:
+        {
+            LOG_WARNING("WPT State Machine SlowCharge state: Thermal pause - suspending power transfer\n");
+            mWptManager.PauseWptForThermal();
+            break;
+        }
+        case WptPort::Event_e::WPT_THERMAL_RESUME:
+        {
+            LOG_INFO("WPT State Machine SlowCharge state: Thermal resume - restoring power transfer\n");
+            mWptManager.ResumeWptFromThermal();
+            break;
+        }
         default:
         {
             //ASSERT(false);

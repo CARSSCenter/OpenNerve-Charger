@@ -38,6 +38,13 @@ namespace svc
         /// Disables the WPT.
         void DisableWpt();
 
+        /// Pauses WPT power delivery for an overtemperature condition, without
+        /// stopping temperature/PGOOD monitoring so recovery can be detected.
+        void PauseWptForThermal();
+
+        /// Resumes WPT power delivery once temperature has recovered.
+        void ResumeWptFromThermal();
+
         /// Stops the WPT scan.
         void StopWptScan();
 
@@ -104,10 +111,9 @@ namespace svc
 
         static constexpr size_t LOOKUP_TABLE_SIZE = sizeof(TEMP_LOOKUP_TABLE) / sizeof(TempResistancePair);
 
-        // IPG Temperature thresholds in Celsius
-        static constexpr int8_t IPG_TEMP_THRESHOLD_HIGH = 41;   // Critical temperature in C
-        static constexpr int8_t IPG_TEMP_THRESHOLD_MEDIUM = 39; // Warning temperature in C
-        static constexpr int8_t IPG_TEMP_THRESHOLD_LOW = 36;    // Normal operating temperature in C
+        // IPG Temperature thresholds in Celsius (single hysteresis band)
+        static constexpr int8_t IPG_TEMP_THRESHOLD_PAUSE = 41;  // Pause power transfer at/above this
+        static constexpr int8_t IPG_TEMP_THRESHOLD_RESUME = 39; // Resume power transfer at/below this
 
         // Enum for power adjustment state machine
         enum class PgoodState : uint8_t

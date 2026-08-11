@@ -115,6 +115,18 @@ namespace svc
             mWptManager.AdjustWptPowerTransfer(static_cast<uint8_t>(optDataAddress));
             break;
         }
+        case WptPort::Event_e::WPT_THERMAL_PAUSE:
+        {
+            LOG_WARNING("WPT State Machine: Thermal pause - suspending power transfer\n");
+            mWptManager.PauseWptForThermal();
+            break;
+        }
+        case WptPort::Event_e::WPT_THERMAL_RESUME:
+        {
+            LOG_INFO("WPT State Machine: Thermal resume - restoring power transfer\n");
+            mWptManager.ResumeWptFromThermal();
+            break;
+        }
         default:
         {
             break;
