@@ -38,8 +38,10 @@ namespace svc
             WPT_SLOW_CHARGE = 0x0C,
             WPT_SCAN_TIMEOUT = 0x0D,
             WPT_ADJUST_POWER = 0x0E,
-            WPT_THERMAL_PAUSE = 0x0F,
-            WPT_THERMAL_RESUME = 0x10
+            /** Suspend/restore coil output for a fault. optDataAddress carries the
+             *  WptManager::PauseReason_e that is being set or cleared. */
+            WPT_FAULT_PAUSE = 0x0F,
+            WPT_FAULT_RESUME = 0x10
         };
 
         WptPort();

@@ -15,17 +15,20 @@
 
 namespace svc
 {
-    bool WptManager::m_is_high_temperature_threshold_exceeded = false;
-
     uint8_t static m_max_power_level;
 
-    WptManager::PgoodState WptManager::pgood_st_machine_current_state;
-    uint8_t WptManager::pgood_st_machine_current_power_level;
-    uint8_t WptManager::pgood_st_machine_stable_power_level;
-    uint8_t WptManager::pgood_st_machine_unstability_toggle_count;
-    uint8_t WptManager::pgood_st_machine_stability_counter;
-    uint8_t WptManager::pgood_st_machine_fine_tune_attempts;
-    bool WptManager::pgood_st_machine_last_pgood_status;
+    uint8_t WptManager::m_pause_reasons = 0;
+    uint16_t WptManager::m_thermal_pause_ticks = 0;
+    uint16_t WptManager::m_ovp_pause_ticks = 0;
+
+    uint8_t WptManager::m_level = WptManager::COLD_START_LEVEL;
+    bool WptManager::m_floor_found = false;
+    uint8_t WptManager::m_ovp_ceiling = WptManager::LEVEL_INVALID;
+    uint8_t WptManager::m_pgood_floor = WptManager::LEVEL_INVALID;
+    uint8_t WptManager::m_blank_cycles = 0;
+    uint8_t WptManager::m_pgood_low_count = 0;
+    uint32_t WptManager::m_last_adv_count = 0;
+    bool WptManager::m_loop_initialized = false;
 
     WptManager &WptManager::Instance()
     {
@@ -41,7 +44,11 @@ namespace svc
 
     eda::Timer WptManager::mStatusTimeoutTimer("WptStatusTimeoutTimer", 5000, 0, StatusTimeoutMonitoring);
 
-    eda::Timer WptManager::mTempPgoodTimer("WptStatusTempPgood", TEMP_PGODD_MONITOR_PERIOD_MS, 1, StatusTempPgoodMonitoring);
+    eda::Timer WptManager::mFaultTimer("WptFaultMonitor", FAULT_MONITOR_PERIOD_MS, 1, FaultMonitoring);
+
+    eda::Timer WptManager::mPowerCtrlTimer("WptPowerCtrl", POWER_CTRL_PERIOD_MS, 1, PowerControlMonitoring);
+
+    eda::Timer WptManager::mColdStartEscalateTimer("WptColdStart", COLD_START_ESCALATE_MS, 0, ColdStartEscalate);
 
     void WptManager::Init()
     {
@@ -49,8 +56,8 @@ namespace svc
         ConfigureGpios();
         DacHalInstance.Init();
         WptHalInstance.Init();
-        ResetPgoodMonitoringStateMachine();
         m_max_power_level = WptHalInstance.GetMaxPulseWidthThresholdStep();
+        ResetPowerControl();
     }
 
     void WptManager::ConfigureGpios()
@@ -99,7 +106,18 @@ namespace svc
 
     void WptManager::EnableWpt()
     {
-        WptHalInstance.Enable();
+        // A fault pause outranks a state entry. StateSlowCharge -> StateCharging on
+        // WPT_POWER_ON re-runs Entry(), and without this guard that would turn the
+        // coil back on underneath an active thermal or OVP pause.
+        if (m_pause_reasons != 0)
+        {
+            LOG_WARNING("WPT Manager: EnableWpt suppressed, fault mask 0x%02X still set\n", m_pause_reasons);
+        }
+        else
+        {
+            WptHalInstance.Enable();
+        }
+
         StartStatusTimeoutTimer();
         StartStatusMonitoring();
         LOG_DEBUG("WPT Manager: EnableWpt\n");
@@ -109,22 +127,48 @@ namespace svc
     {
         WptHalInstance.Disable();
         StopStatusMonitoring();
-        ResetPgoodMonitoringStateMachine();
         StopIpgTemperaturePgoodMonitoringTimer();
+        mColdStartEscalateTimer.Stop();
+        ResetPowerControl();
         LOG_DEBUG("WPT Manager: DisableWpt\n");
     }
 
-    void WptManager::PauseWptForThermal()
+    void WptManager::PauseWpt(uint8_t reason)
     {
-        WptHalInstance.Disable();
-        LOG_WARNING("WPT Manager: PauseWptForThermal - coil output disabled, monitoring continues\n");
+        // Only the first reason actually stops the coil; a second concurrent fault
+        // must not re-issue Disable(), and more importantly must not be able to
+        // resume on its own later while the first one is still asserted.
+        const bool was_running = (m_pause_reasons == 0);
+
+        m_pause_reasons |= reason;
+
+        if (was_running)
+        {
+            WptHalInstance.Disable();
+        }
+
+        // Deliberately does not touch mFaultTimer or mPowerCtrlTimer: monitoring has
+        // to keep running through a pause or the recovery condition can never be
+        // observed. This is the decoupling that made thermal auto-resume work.
+        LOG_WARNING("WPT Manager: PauseWpt reason 0x%02X, mask now 0x%02X, coil %s\n",
+                    reason, m_pause_reasons, was_running ? "disabled" : "already off");
     }
 
-    void WptManager::ResumeWptFromThermal()
+    void WptManager::ResumeWpt(uint8_t reason)
     {
-        WptHalInstance.Enable();
-        ResetPgoodMonitoringStateMachine();
-        LOG_INFO("WPT Manager: ResumeWptFromThermal - coil output re-enabled\n");
+        m_pause_reasons &= static_cast<uint8_t>(~reason);
+
+        if (m_pause_reasons == 0)
+        {
+            WptHalInstance.Enable();
+            LOG_INFO("WPT Manager: ResumeWpt reason 0x%02X cleared, coil re-enabled at level %d\n",
+                     reason, m_level);
+        }
+        else
+        {
+            LOG_WARNING("WPT Manager: ResumeWpt reason 0x%02X cleared but mask still 0x%02X, coil stays off\n",
+                        reason, m_pause_reasons);
+        }
     }
 
     void WptManager::StopWptScan()
@@ -193,14 +237,41 @@ namespace svc
 
     void WptManager::StartIpgTemperaturePgoodMonitoringTimer()
     {
+        // Fault sampling and power control run at different rates but share a
+        // lifetime, so callers still start and stop them as one unit.
         LOG_DEBUG("WPT Manager: StartIpgTemperatureMonitoringTimer\n");
-        mTempPgoodTimer.Start();
+        mFaultTimer.Start();
+        mPowerCtrlTimer.Start();
     }
 
     void WptManager::StopIpgTemperaturePgoodMonitoringTimer()
     {
         LOG_DEBUG("WPT Manager: StopIpgTemperatureMonitoringTimer\n");
-        mTempPgoodTimer.Stop();
+        mFaultTimer.Stop();
+        mPowerCtrlTimer.Stop();
+    }
+
+    void WptManager::StartColdStartEscalation()
+    {
+        LOG_INFO("WPT Manager: Cold start at level %d, escalating to max in %d ms if no IPG advertisement\n",
+                 COLD_START_LEVEL, COLD_START_ESCALATE_MS);
+        SetPowerLevel(COLD_START_LEVEL);
+        mColdStartEscalateTimer.Start();
+    }
+
+    void WptManager::ColdStartEscalate(TimerHandle_t xTimer)
+    {
+        // Self-guarding: if an advertisement arrived while this timer was pending,
+        // the closed loop now owns the power level and must not be overridden.
+        // That removes any need to cancel this timer on the BLE-found path.
+        if (svc::BleManager::GetAdvertisementCount() != 0)
+        {
+            LOG_INFO("WPT Manager: Cold start escalation skipped, IPG already advertising\n");
+            return;
+        }
+
+        LOG_WARNING("WPT Manager: Cold start escalating to maximum power, still no IPG advertisement\n");
+        SetPowerLevel(LEVEL_REQUEST_MAX);
     }
 
     float WptManager::CalculateTemperatureFromBle(uint16_t get_therm_ref,
@@ -258,6 +329,14 @@ namespace svc
 
     void WptManager::IpgTemperatureMonitoring(void)
     {
+        // With no advertisement parsed yet the thermistor fields are all zero, which
+        // makes the resistance calculation degenerate and falls through to the
+        // table's top entry (50 C) - an instant spurious thermal pause.
+        if (svc::BleManager::GetAdvertisementCount() == 0)
+        {
+            return;
+        }
+
         const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
         svc::ChargingStatusParameters_t ChargingStatusParameters = advData.chargingStatusParameters;
 
@@ -271,32 +350,133 @@ namespace svc
            ChargingStatusParameters.GET_THERM_OUT,
            ChargingStatusParameters.GET_THERM_OFST);
 
-        // Single hysteresis band: pause at/above PAUSE, resume at/below RESUME.
-        // Between the two thresholds, hold the current state.
-        if (ipg_temperature >= IPG_TEMP_THRESHOLD_PAUSE)
+        const bool thermally_paused = (m_pause_reasons & PAUSE_THERMAL) != 0;
+
+        if (!thermally_paused)
         {
-            if (!m_is_high_temperature_threshold_exceeded)
+            if (ipg_temperature >= IPG_TEMP_THRESHOLD_PAUSE)
             {
                 LOG_ERROR("WPT Manager: IPG temperature %d.%02d C reached pause threshold (%d C), pausing power transfer",
                           (int32_t)ipg_temperature,
                           (int32_t)((ipg_temperature) * 100) % 100,
                           IPG_TEMP_THRESHOLD_PAUSE);
-                WptPort::SendEventFromISR(WptPort::Event_e::WPT_THERMAL_PAUSE, NULL);
-                m_is_high_temperature_threshold_exceeded = true;
+                m_thermal_pause_ticks = 0;
+                WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
+                                          static_cast<uint32_t>(PAUSE_THERMAL));
             }
+            return;
         }
-        else if (ipg_temperature <= IPG_TEMP_THRESHOLD_RESUME)
+
+        // Held in a thermal pause. Resume needs both a minimum dwell and a genuine
+        // recovery below the lower hysteresis threshold - the dwell alone would let
+        // us re-enable into an implant that is still at the limit, producing a
+        // power burst cycle instead of a controlled hold.
+        m_thermal_pause_ticks++;
+
+        if (m_thermal_pause_ticks < THERMAL_PAUSE_MIN_TICKS)
         {
-            if (m_is_high_temperature_threshold_exceeded)
-            {
-                LOG_INFO("WPT Manager: IPG temperature %d.%02d C reached resume threshold (%d C), resuming power transfer",
-                         (int32_t)ipg_temperature,
-                         (int32_t)((ipg_temperature) * 100) % 100,
-                         IPG_TEMP_THRESHOLD_RESUME);
-                WptPort::SendEventFromISR(WptPort::Event_e::WPT_THERMAL_RESUME, NULL);
-                m_is_high_temperature_threshold_exceeded = false;
-            }
+            return;
         }
+
+        if (ipg_temperature > IPG_TEMP_THRESHOLD_RESUME)
+        {
+            return;
+        }
+
+        LOG_INFO("WPT Manager: IPG temperature %d.%02d C at/below resume threshold (%d C) after %d ticks, resuming power transfer",
+                 (int32_t)ipg_temperature,
+                 (int32_t)((ipg_temperature) * 100) % 100,
+                 IPG_TEMP_THRESHOLD_RESUME,
+                 m_thermal_pause_ticks);
+
+        // A thermal trip is direct evidence that the level we settled on delivers
+        // more power than this coupling needs, so re-arm the downward search. This
+        // is the only event that reopens it once a floor has been found.
+        m_floor_found = false;
+        m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+
+        WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
+                                  static_cast<uint32_t>(PAUSE_THERMAL));
+    }
+
+    void WptManager::IpgOvpMonitoring(void)
+    {
+        // mAdvertisementData is zero-initialised and the IPG's fault bits are
+        // active-low, so before the first advertisement every fault reads as
+        // asserted. Without this guard the charger pauses for OVP at every startup.
+        if (svc::BleManager::GetAdvertisementCount() == 0)
+        {
+            return;
+        }
+
+        const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
+        const svc::ChargingStatusParameters_t &p = advData.chargingStatusParameters;
+
+        // Raw active-low bits straight from the IPG MSD GPIO byte: 0 = asserted.
+        // CHG1 is excluded deliberately - CHG1_STATUS reads 1 in every state
+        // observed on this hardware and CHG2 is the battery actually being charged,
+        // so gating on CHG1_OVP_ERR would add noise without signal. Logged only.
+        const bool vrect_ovp = (p.GET_VRECT_OVP == 0);
+        const bool chg2_ovp = (p.GET_CHG2_OVP_ERR == 0);
+        const bool ovp_active = vrect_ovp || chg2_ovp;
+
+        const bool ovp_paused = (m_pause_reasons & PAUSE_OVP) != 0;
+
+        if (!ovp_paused)
+        {
+            if (!ovp_active)
+            {
+                return;
+            }
+
+            // Remember the lowest level that has ever faulted. Without this the
+            // "PGOOD is low, add power" rule walks straight back into the level we
+            // just tripped on, and the two controllers oscillate indefinitely.
+            if (m_ovp_ceiling == LEVEL_INVALID || m_level < m_ovp_ceiling)
+            {
+                m_ovp_ceiling = m_level;
+            }
+
+            LOG_ERROR("WPT Manager: IPG OVP asserted at level %d (vrect=%d chg2=%d chg1=%d), ceiling now %d, pausing",
+                      m_level, vrect_ovp, chg2_ovp, (p.GET_CHG1_OVP_ERR == 0), m_ovp_ceiling);
+
+            m_ovp_pause_ticks = 0;
+            WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
+                                      static_cast<uint32_t>(PAUSE_OVP));
+            return;
+        }
+
+        m_ovp_pause_ticks++;
+
+        if (m_ovp_pause_ticks < OVP_PAUSE_MIN_TICKS)
+        {
+            return;
+        }
+
+        if (ovp_active)
+        {
+            LOG_WARNING("WPT Manager: IPG OVP still asserted after %d ticks, staying paused\n", m_ovp_pause_ticks);
+            return;
+        }
+
+        // Back off one step before restoring power. The IPG's own comment on its
+        // 5 s pause hold says it expects the charger to have reduced coil power by
+        // the time it re-enables; without that this pair just re-trips.
+        if (m_level > MIN_POWER_LEVEL)
+        {
+            SetPowerLevel(m_level - 1);
+        }
+
+        // The IPG's VCHG rail needs a moment to come back after it re-enables, so
+        // PGOOD reads 0 with OVP already cleared. That is exactly the "add power"
+        // condition, which would undo the back-off - so skip a control cycle.
+        m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+
+        LOG_INFO("WPT Manager: IPG OVP cleared after %d ticks, resuming one step down at level %d\n",
+                 m_ovp_pause_ticks, m_level);
+
+        WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
+                                  static_cast<uint32_t>(PAUSE_OVP));
     }
 
     void WptManager::AdjustWptPowerTransfer(uint8_t step)
@@ -305,277 +485,189 @@ namespace svc
         WptHalInstance.SetPulseWidthThresholdStep(step);
     }
 
-    void WptManager::ResetPgoodMonitoringStateMachine()
+    void WptManager::ResetPowerControl()
     {
-        // Reset all state machine variables to their initial values
-        pgood_st_machine_current_state = PgoodState::INIT;
-        pgood_st_machine_current_power_level = 0;
-        pgood_st_machine_stable_power_level = 0;
-        pgood_st_machine_unstability_toggle_count = 0;
-        pgood_st_machine_stability_counter = 0;
-        pgood_st_machine_fine_tune_attempts = 0;
-        pgood_st_machine_last_pgood_status = false;
+        m_pause_reasons = 0;
+        m_thermal_pause_ticks = 0;
+        m_ovp_pause_ticks = 0;
 
-        LOG_INFO("WPT Manager: PGOOD state machine variables initialized");
+        m_level = COLD_START_LEVEL;
+        m_floor_found = false;
+        m_ovp_ceiling = LEVEL_INVALID;
+        m_pgood_floor = LEVEL_INVALID;
+        m_blank_cycles = 0;
+        m_pgood_low_count = 0;
+        m_last_adv_count = 0;
+        m_loop_initialized = false;
+
+        LOG_INFO("WPT Manager: Power control reset, level %d\n", m_level);
     }
 
-    void WptManager::IpgPgoodMonitoring(void)
+    bool WptManager::IsPowerWindowEmpty()
     {
-        // State Machine for PGOOD-based Power Management
-        //
-        // This function implements a state machine that incrementally adjusts wireless power
-        // transmission levels based on the PGOOD signal from the device being charged.
-        //
-        // The state machine has the following states:
-        //
-        // 1. INIT: Initial state that resets power to minimum level
-        // 2. INCREASING_POWER: Incrementally increases power until PGOOD=1 is detected
-        // 3. STABILIZING: Confirms stability at current power level before proceeding
-        // 4. FINE_TUNING: Attempts to optimize power level for best charging efficiency
-        // 5. STABLE: Maintains stable operation while monitoring for changes
+        // At very close coupling the level that trips OVP can sit at or below the
+        // level PGOOD needs, so no setting satisfies the IPG without faulting it.
+        // Detecting that is what stops the loop ping-ponging between two adjacent
+        // steps for the whole session.
+        return (m_ovp_ceiling != LEVEL_INVALID) &&
+               (m_pgood_floor != LEVEL_INVALID) &&
+               ((m_pgood_floor + 1) >= m_ovp_ceiling);
+    }
 
-        // Get current PGOOD status from BLE advertisement data
-        const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
-        svc::ChargingStatusParameters_t ChargingStatusParameters = advData.chargingStatusParameters;
-        bool pgood_status = ChargingStatusParameters.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD;
+    void WptManager::PowerControlMonitoring(TimerHandle_t xTimer)
+    {
+        // Bidirectional search for the lowest PTH ceiling the IPG still accepts.
+        //
+        // PGOOD alone is ambiguous: the IPG drops VCHG_DISABLE and therefore PGOOD
+        // both when it is receiving too little power AND when its own OVP
+        // protection has fired because it is receiving too much. Those need
+        // opposite corrections. This function only ever sees the first case,
+        // because faults are owned entirely by the fault timer below and it bails
+        // out whenever one is active - so here PGOOD=0 unambiguously means "more".
 
-        LOG_INFO("WPT Manager: PGOOD status: %d, State: %d, Power level: %d",
-                 pgood_status, static_cast<uint8_t>(pgood_st_machine_current_state), pgood_st_machine_current_power_level);
-
-        // State machine implementation
-        switch (pgood_st_machine_current_state)
+        if (m_pause_reasons != 0)
         {
-        // INIT State
-        //
-        // Purpose: Initialize the power level to minimum and start the power adjustment process
-        //
-        // Actions:
-        // - Set power to minimum level
-        // - Log initialization
-        // - Transition to INCREASING_POWER state
-        //
-        // Next States:
-        // - Always transitions to INCREASING_POWER
-        case PgoodState::INIT:
-            // Initialize to minimum power
-            pgood_st_machine_current_power_level = MIN_POWER_LEVEL;
-            SetPowerLevel(pgood_st_machine_current_power_level);
-            LOG_INFO("WPT Manager: Initializing power at minimum level %d", pgood_st_machine_current_power_level);
-            pgood_st_machine_current_state = PgoodState::INCREASING_POWER;
-            break;
-
-        // INCREASING_POWER State
-        //
-        // Purpose: Incrementally increase power until PGOOD=1 is detected
-        //
-        // Actions:
-        // - If PGOOD=1: Save current power level as stable and move to STABILIZING
-        // - If PGOOD=0 and below max power: Increase power by one step
-        // - If PGOOD=0 and at max power: Reset to minimum and try again
-        //
-        // Next States:
-        // - STABILIZING: When PGOOD=1 is detected
-        // - INIT: When max power is reached without finding PGOOD=1
-        // - Remains in INCREASING_POWER: While increasing power and PGOOD=0
-        case PgoodState::INCREASING_POWER:
-            if (pgood_status)
-            {
-                // We found PGOOD=1, now stabilize at this power level
-                LOG_INFO("WPT Manager: PGOOD=1 detected at power level %d, stabilizing", pgood_st_machine_current_power_level);
-                pgood_st_machine_stable_power_level = pgood_st_machine_current_power_level;
-                pgood_st_machine_stability_counter = 0;
-                pgood_st_machine_current_state = PgoodState::STABILIZING;
-            }
-            else if (pgood_st_machine_current_power_level < m_max_power_level)
-            {
-                // Increase power by one step since PGOOD is still 0
-                pgood_st_machine_current_power_level++;
-                SetPowerLevel(pgood_st_machine_current_power_level);
-                LOG_INFO("WPT Manager: Increasing power to level %d", pgood_st_machine_current_power_level);
-            }
-            else
-            {
-                // We've reached max power but still no PGOOD=1
-                LOG_WARNING("WPT Manager: Reached maximum power level without PGOOD=1");
-                // Reset to minimum and try again
-                pgood_st_machine_current_power_level = MIN_POWER_LEVEL;
-                SetPowerLevel(pgood_st_machine_current_power_level);
-                LOG_INFO("WPT Manager: Resetting to minimum power level %d", pgood_st_machine_current_power_level);
-            }
-            break;
-
-        // STABILIZING State
-        //
-        // Purpose: Confirm stability at current power level before attempting optimization
-        //
-        // Actions:
-        // - If PGOOD=1: Increment stability counter
-        // - If stability threshold reached: Move to FINE_TUNING or STABLE based on power level
-        // - If PGOOD=0: Power level is unstable, revert to previous stable level or INIT
-        //
-        // Next States:
-        // - FINE_TUNING: When stability threshold is reached and below max power
-        // - STABLE: When stability threshold is reached at max power
-        // - INIT: When no stable level is found
-        // - Remains in STABILIZING: While counting stable cycles
-        case PgoodState::STABILIZING:
-            if (pgood_status)
-            {
-                // PGOOD remains at 1, counting stable cycles
-                pgood_st_machine_stability_counter++;
-                LOG_INFO("WPT Manager: PGOOD stable for %d cycles at power level %d",
-                         pgood_st_machine_stability_counter, pgood_st_machine_current_power_level);
-
-                if (pgood_st_machine_stability_counter >= STABILITY_THRESHOLD)
-                {
-                    // We have stable PGOOD for sufficient cycles
-                    if (pgood_st_machine_current_power_level < m_max_power_level)
-                    {
-                        // Try fine-tuning with a bit more power
-                        LOG_INFO("WPT Manager: Stable PGOOD achieved, attempting fine-tuning");
-                        pgood_st_machine_fine_tune_attempts = 0;
-                        pgood_st_machine_unstability_toggle_count = 0;
-                        pgood_st_machine_current_state = PgoodState::FINE_TUNING;
-                    }
-                    else
-                    {
-                        // Already at max power with stable PGOOD
-                        LOG_INFO("WPT Manager: Stable PGOOD at maximum power level");
-                        pgood_st_machine_current_state = PgoodState::STABLE;
-                    }
-                }
-            }
-            else
-            {
-                // PGOOD toggled back to 0, current level is unstable
-                // No stable level found, restart process
-                LOG_WARNING("WPT Manager: No stable level found, restarting");
-                pgood_st_machine_current_state = PgoodState::INIT;
-            }
-            break;
-
-        // FINE_TUNING State
-        //
-        // Purpose: Optimize power level by attempting incremental increases
-        //
-        // Actions:
-        // - Monitor PGOOD toggle behavior to detect stability boundaries
-        // - If PGOOD toggles frequently: Try another power level or revert to stable level
-        // - If PGOOD consistently 1: Count stability cycles for new potential stable level
-        // - If PGOOD consistently 0: Reduce power level and reset counters
-        //
-        // Next States:
-        // - STABLE: When new optimal level is found or fine-tuning fails
-        // - Remains in FINE_TUNING: While testing different power levels
-        case PgoodState::FINE_TUNING:
-            // Check if PGOOD status changed from previous reading
-            if (pgood_status != pgood_st_machine_last_pgood_status)
-            {
-                pgood_st_machine_unstability_toggle_count++;
-                LOG_INFO("WPT Manager: PGOOD toggled during fine-tuning, count: %d", pgood_st_machine_unstability_toggle_count);
-
-                // If PGOOD is toggling too much, fine-tuning this power level isn't working
-                if (pgood_st_machine_unstability_toggle_count >= MAX_COUNT_TOGGLING)
-                {
-                    if (pgood_st_machine_fine_tune_attempts < MAX_FINE_TUNE_STEPS)
-                    {
-                        // Try another fine-tuning step
-                        pgood_st_machine_fine_tune_attempts++;
-                        pgood_st_machine_current_power_level++;
-
-                        if (pgood_st_machine_current_power_level > m_max_power_level)
-                        {
-                            pgood_st_machine_current_power_level = m_max_power_level;
-                        }
-
-                        SetPowerLevel(pgood_st_machine_current_power_level);
-                        LOG_INFO("WPT Manager: Trying another fine-tune step, power level %d", pgood_st_machine_current_power_level);
-                        pgood_st_machine_unstability_toggle_count = 0;
-                    }
-                    else
-                    {
-                        // Fine-tuning failed, revert to stable power level
-                        LOG_WARNING("WPT Manager: Fine-tuning failed after %d attempts", pgood_st_machine_fine_tune_attempts);
-                        pgood_st_machine_current_power_level = pgood_st_machine_stable_power_level;
-                        SetPowerLevel(pgood_st_machine_current_power_level);
-                        LOG_INFO("WPT Manager: Reverting to stable power level %d", pgood_st_machine_current_power_level);
-                        pgood_st_machine_current_state = PgoodState::STABLE;
-                    }
-                }
-            }
-            else if (pgood_status)
-            {
-                // PGOOD is consistently 1, this might be a better stable point
-                pgood_st_machine_stability_counter++;
-
-                if (pgood_st_machine_stability_counter >= STABILITY_THRESHOLD)
-                {
-                    LOG_INFO("WPT Manager: Found improved stable level at %d", pgood_st_machine_current_power_level);
-                    pgood_st_machine_stable_power_level = pgood_st_machine_current_power_level;
-                    pgood_st_machine_current_state = PgoodState::STABLE;
-                }
-            }
-            else
-            {
-                // PGOOD is consistently 0, this level is too high
-                LOG_WARNING("WPT Manager: Power level %d is too high, PGOOD consistently 0", pgood_st_machine_current_power_level);
-                if (pgood_st_machine_current_power_level > MIN_POWER_LEVEL)
-                {
-                    pgood_st_machine_current_power_level--;
-                }
-                SetPowerLevel(pgood_st_machine_current_power_level);
-                LOG_INFO("WPT Manager: Reducing to power level %d", pgood_st_machine_current_power_level);
-                pgood_st_machine_unstability_toggle_count = 0;
-                pgood_st_machine_stability_counter = 0;
-            }
-            break;
-
-        // STABLE State
-        //
-        // Purpose: Maintain stable operation while monitoring for changes in PGOOD status
-        //
-        // Actions:
-        // - Monitor PGOOD status for changes
-        // - If PGOOD drops to 0: Stability is lost, return to power adjustment process
-        // - If PGOOD remains 1: Log stable operation periodically
-        //
-        // Next States:
-        // - INCREASING_POWER: When stability is lost (PGOOD=0)
-        // - Remains in STABLE: While PGOOD=1
-        case PgoodState::STABLE:
-            // Monitor for changes in stable operation
-            if (!pgood_status)
-            {
-                // PGOOD dropped to 0, stability lost
-                LOG_WARNING("WPT Manager: Stability lost at power level %d", pgood_st_machine_current_power_level);
-                // Try to recover by going back to increasing power
-                pgood_st_machine_current_state = PgoodState::INCREASING_POWER;
-            }
-            else
-            {
-                // Periodically log that we're in stable operation
-                LOG_INFO("WPT Manager: Stable operation at power level %d", pgood_st_machine_current_power_level);
-            }
-            break;
+            LOG_DEBUG("WPT Manager: Power control skipped, fault mask 0x%02X owns the level\n", m_pause_reasons);
+            return;
         }
 
-        // Save current PGOOD status for next iteration
-        pgood_st_machine_last_pgood_status = pgood_status;
+        if (m_blank_cycles > 0)
+        {
+            m_blank_cycles--;
+            LOG_DEBUG("WPT Manager: Power control blanked after fault resume, %d cycles left\n", m_blank_cycles);
+            return;
+        }
+
+        const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
+
+        // No fresh telemetry since the last decision, so the last change has not
+        // been observed yet. Also covers cold start, where the count stays 0 and
+        // the open-loop escalation owns the level instead.
+        if (adv_count == m_last_adv_count)
+        {
+            LOG_WARNING("WPT Manager: Power control skipped, no new IPG advertisement since last step\n");
+            return;
+        }
+
+        m_last_adv_count = adv_count;
+
+        // First cycle with real telemetry: take the level back to the mid-range
+        // start, wherever the open-loop cold-start attempt happened to leave it.
+        if (!m_loop_initialized)
+        {
+            m_loop_initialized = true;
+            SetPowerLevel(COLD_START_LEVEL);
+            LOG_INFO("WPT Manager: Closed loop starting at level %d\n", m_level);
+            return;
+        }
+
+        const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
+        const bool pgood = (advData.chargingStatusParameters.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD == 1);
+
+        LOG_INFO("WPT Manager: Power control level=%d pgood=%d floor_found=%d ovp_ceiling=%d pgood_floor=%d",
+                 m_level, pgood, m_floor_found, m_ovp_ceiling, m_pgood_floor);
+
+        if (pgood)
+        {
+            m_pgood_low_count = 0;
+
+            if (m_floor_found)
+            {
+                LOG_INFO("WPT Manager: Holding at level %d\n", m_level);
+                return;
+            }
+
+            if (m_level > MIN_POWER_LEVEL)
+            {
+                SetPowerLevel(m_level - 1);
+                LOG_INFO("WPT Manager: PGOOD satisfied, stepping down to level %d\n", m_level);
+            }
+            else
+            {
+                m_floor_found = true;
+                LOG_INFO("WPT Manager: PGOOD satisfied at minimum level, floor found\n");
+            }
+
+            return;
+        }
+
+        // Reject single-sample dropouts. A real insufficiency is only delayed by
+        // one cycle, but transient noise no longer moves the level at all.
+        m_pgood_low_count++;
+
+        if (m_pgood_low_count < PGOOD_LOW_CONFIRM)
+        {
+            LOG_WARNING("WPT Manager: PGOOD low %d/%d at level %d, waiting for confirmation\n",
+                        m_pgood_low_count, PGOOD_LOW_CONFIRM, m_level);
+            return;
+        }
+
+        m_pgood_low_count = 0;
+        m_pgood_floor = m_level;
+
+        // Confirmed insufficiency ends the downward search: this level is below
+        // what the IPG needs, so there is nothing lower worth trying.
+        m_floor_found = true;
+
+        if (IsPowerWindowEmpty())
+        {
+            // Settle at the highest level that has not faulted and stop searching.
+            // Undervoltage charging is slow but stable; oscillating between a
+            // faulting level and an insufficient one delivers nothing at all.
+            const uint8_t best = (m_ovp_ceiling > MIN_POWER_LEVEL)
+                                     ? static_cast<uint8_t>(m_ovp_ceiling - 1)
+                                     : MIN_POWER_LEVEL;
+
+            LOG_ERROR("WPT Manager: No viable power level - OVP ceiling %d at or below PGOOD floor %d. Clamping to %d",
+                      m_ovp_ceiling, m_pgood_floor, best);
+
+            if (m_level != best)
+            {
+                SetPowerLevel(best);
+            }
+
+            return;
+        }
+
+        if (m_level >= m_max_power_level)
+        {
+            LOG_WARNING("WPT Manager: PGOOD low at maximum level %d, nothing further to give\n", m_level);
+            return;
+        }
+
+        // Climbing past a level that has already faulted the IPG is prevented by
+        // IsPowerWindowEmpty() above: m_pgood_floor was just set to m_level, so
+        // "the next step reaches the OVP ceiling" and "the window is empty" are the
+        // same condition, and the empty-window branch has already returned.
+        SetPowerLevel(m_level + 1);
+        LOG_INFO("WPT Manager: PGOOD low, stepping up to level %d\n", m_level);
     }
 
     void WptManager::SetPowerLevel(uint8_t level)
     {
-        // Send event to adjust power level
+        // Normalise before recording so m_level always names a real step. The HAL
+        // clamps anything above the maximum, so LEVEL_REQUEST_MAX must not be
+        // stored verbatim or every later comparison against it would be wrong.
+        if (level > m_max_power_level)
+        {
+            level = m_max_power_level;
+        }
+
+        m_level = level;
+
         WptPort::SendEventFromISR(WptPort::Event_e::WPT_ADJUST_POWER, static_cast<uint32_t>(level));
     }
 
-    void WptManager::StatusTempPgoodMonitoring(TimerHandle_t xTimer)
+    void WptManager::FaultMonitoring(TimerHandle_t xTimer)
     {
-        LOG_DEBUG("WPT Manager: StatusTempPgoodMonitoring\n");
+        LOG_DEBUG("WPT Manager: FaultMonitoring\n");
+
+        // OVP first: it is the condition the IPG gives us the least time to react
+        // to, and it is what disambiguates the PGOOD reading the power control
+        // timer will make on its next tick.
+        IpgOvpMonitoring();
 
         IpgTemperatureMonitoring();
-
-        IpgPgoodMonitoring();
 
         LOG_FLUSH();
     }

@@ -20,7 +20,7 @@
 
 #define TIMER_NAME "BleTimeoutTimer"
 #define SCAN_TIMEOUT_MS 10000            // Blue-light (StateScan) and StateCharge timeout
-#define SCAN_TIMEOUT_SLOW_CHARGE_MS 30000 // White-light (StateSlowChargeAndScan) timeout
+#define SCAN_TIMEOUT_SLOW_CHARGE_MS 10000 // White-light (StateSlowChargeAndScan) timeout
 #define PERIODIC 1
 #define ONESHOT 0
 
@@ -90,15 +90,32 @@ namespace svc
         static void SetScanTimeout(uint32_t timeoutMs);
 
         // Getter for advertisement data
-        static const AdvertisementData_t& GetAdvertisementData() 
+        static const AdvertisementData_t& GetAdvertisementData()
         {
             return mAdvertisementData;
+        }
+
+        /// Number of IPG advertisements parsed since boot.
+        ///
+        /// Two uses, both necessary because GetAdvertisementData() otherwise
+        /// returns the last parsed advertisement forever with no way to tell how
+        /// old it is:
+        ///  - zero means no advertisement has ever been parsed, so the all-zero
+        ///    contents of mAdvertisementData must not be read as real telemetry
+        ///    (the IPG's fault bits are active-low, so zeros read as faults);
+        ///  - an unchanged value between two control decisions means no fresh
+        ///    telemetry arrived, so the previous decision has not been observed yet.
+        static uint32_t GetAdvertisementCount()
+        {
+            return mAdvertisementCounter;
         }
 
     private:
         static EventHandler_t mEventHandler;
 
         static AdvertisementData_t mAdvertisementData;
+
+        static uint32_t mAdvertisementCounter;
 
         static eda::Timer mTimeoutTimer;
 
