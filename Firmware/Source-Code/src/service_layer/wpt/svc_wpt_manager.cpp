@@ -263,7 +263,13 @@ namespace svc
 
         float ipg_temperature = CalculateTemperatureFromBle(ChargingStatusParameters.GET_THERM_REF, ChargingStatusParameters.GET_THERM_OUT, ChargingStatusParameters.GET_THERM_OFST);
 
-        LOG_INFO("WPT Manager: IPG Temperature %d C\n", ipg_temperature);
+        LOG_INFO("WPT Manager: IPG Temperature %d.%02d C\n",
+           (int32_t)ipg_temperature, (int32_t)(ipg_temperature * 100) % 100);
+
+        LOG_INFO("WPT Manager: therm raw ref=%d out=%d ofst=%d mV\n",
+           ChargingStatusParameters.GET_THERM_REF,
+           ChargingStatusParameters.GET_THERM_OUT,
+           ChargingStatusParameters.GET_THERM_OFST);
 
         // Single hysteresis band: pause at/above PAUSE, resume at/below RESUME.
         // Between the two thresholds, hold the current state.
