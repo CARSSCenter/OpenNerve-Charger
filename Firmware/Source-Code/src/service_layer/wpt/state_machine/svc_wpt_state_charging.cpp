@@ -84,11 +84,12 @@ namespace svc
         }
         case WptPort::Event_e::WPT_SLOW_CHARGE:
         {
-            // Clamp PTH1/PTH2 to minimum power (400mV, step 0) during slow charge mode.
-            // The LTC4125 continues its internal search cycles but its weak drive (~5-40uA)
-            // is overridden by the low-impedance DAC, holding pulse width at minimum.
-            LOG_DEBUG("WPT State Machine Charging state: WPT Slow Charge - setting minimum power\n");
-            mWptManager.AdjustWptPowerTransfer(0);
+            // Cold start: no IPG advertisement yet, so there is no PGOOD or OVP to
+            // steer by. Drive a mid-range PTH now and escalate to maximum partway
+            // through the scan window if nothing has answered - minimum power was
+            // never enough to bring a drained IPG's VRECT up to boot.
+            LOG_DEBUG("WPT State Machine Charging state: WPT Slow Charge - cold start power\n");
+            mWptManager.StartColdStartEscalation();
             break;
         }
         case WptPort::Event_e::WPT_BATTERY_CHARGED:
@@ -113,6 +114,21 @@ namespace svc
         {
             LOG_DEBUG("WPT State Machine SlowCharge state: WPT Adjust Power\n");
             mWptManager.AdjustWptPowerTransfer(static_cast<uint8_t>(optDataAddress));
+            break;
+        }
+        case WptPort::Event_e::WPT_FAULT_PAUSE:
+        {
+            // No state change: monitoring must keep running so the recovery
+            // condition can be seen, and the app layer stays in StateCharge so no
+            // button press is needed to come back.
+            LOG_WARNING("WPT State Machine: Fault pause - suspending power transfer\n");
+            mWptManager.PauseWpt(static_cast<uint8_t>(optDataAddress));
+            break;
+        }
+        case WptPort::Event_e::WPT_FAULT_RESUME:
+        {
+            LOG_INFO("WPT State Machine: Fault resume - restoring power transfer\n");
+            mWptManager.ResumeWpt(static_cast<uint8_t>(optDataAddress));
             break;
         }
         default:

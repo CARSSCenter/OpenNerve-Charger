@@ -20,8 +20,14 @@
 
 namespace svc
 {
-    // Define the time to wait for temperature and pgood signal
-    static constexpr uint32_t TEMP_PGODD_MONITOR_PERIOD_MS = 2000; // 2000 Milliseconds (adjust as needed)
+    // Fault monitoring (IPG temperature + OVP) runs fast: the IPG only holds itself
+    // in its PAUSED state for WPT_OVP_PAUSE_HOLD_MS (5 s) after a VRECT_OVP event
+    // before re-enabling, so the charger has to see and react inside that window.
+    static constexpr uint32_t FAULT_MONITOR_PERIOD_MS = 2000; // 2 s
+
+    // Power control runs slow: a PTH change needs time to settle and then has to
+    // propagate back through an IPG BLE advertisement before it can be evaluated.
+    static constexpr uint32_t POWER_CTRL_PERIOD_MS = 10000; // 10 s
 
     class WptManager
     {
@@ -37,6 +43,26 @@ namespace svc
 
         /// Disables the WPT.
         void DisableWpt();
+
+        /// Reasons the coil output can be held off. The coil is enabled only when
+        /// no reason is set, so overlapping faults cannot resume each other's pause.
+        enum PauseReason_e : uint8_t
+        {
+            PAUSE_THERMAL = 1 << 0,
+            PAUSE_OVP = 1 << 1
+        };
+
+        /// Suspends coil output for a fault condition, without stopping fault or
+        /// power monitoring, so the recovery condition can still be detected.
+        ///
+        /// @param reason One of PauseReason_e
+        void PauseWpt(uint8_t reason);
+
+        /// Clears one pause reason. The coil is re-enabled only once every reason
+        /// has been cleared.
+        ///
+        /// @param reason One of PauseReason_e
+        void ResumeWpt(uint8_t reason);
 
         /// Stops the WPT scan.
         void StopWptScan();
@@ -67,6 +93,11 @@ namespace svc
 
         /// Stops the IPG temp and PGOOD status timer.
         void StopIpgTemperaturePgoodMonitoringTimer();
+
+        /// Begins the open-loop cold-start attempt: drives COLD_START_LEVEL now and
+        /// escalates to maximum power after COLD_START_ESCALATE_MS if no IPG
+        /// advertisement has been seen by then.
+        void StartColdStartEscalation();
 
         /// Set Wpt power Transfer pulse width
         void AdjustWptPowerTransfer(uint8_t step);
@@ -104,26 +135,47 @@ namespace svc
 
         static constexpr size_t LOOKUP_TABLE_SIZE = sizeof(TEMP_LOOKUP_TABLE) / sizeof(TempResistancePair);
 
-        // IPG Temperature thresholds in Celsius
-        static constexpr int8_t IPG_TEMP_THRESHOLD_HIGH = 41;   // Critical temperature in C
-        static constexpr int8_t IPG_TEMP_THRESHOLD_MEDIUM = 39; // Warning temperature in C
-        static constexpr int8_t IPG_TEMP_THRESHOLD_LOW = 36;    // Normal operating temperature in C
+        // IPG Temperature thresholds in Celsius (single hysteresis band)
+        static constexpr int8_t IPG_TEMP_THRESHOLD_PAUSE = 41;  // Pause power transfer at/above this
+        static constexpr int8_t IPG_TEMP_THRESHOLD_RESUME = 39; // Resume power transfer at/below this
 
-        // Enum for power adjustment state machine
-        enum class PgoodState : uint8_t
-        {
-            INIT,             // Initial state
-            INCREASING_POWER, // Incrementally increasing power
-            STABILIZING,      // Found initial PGOOD=1, stabilizing
-            FINE_TUNING,      // Fine-tuning power for stability
-            STABLE            // Stable operation achieved
-        };
+        // Minimum time held in a thermal pause before resume is even considered,
+        // counted in FAULT_MONITOR_PERIOD_MS ticks. 15 * 2 s = 30 s.
+        static constexpr uint16_t THERMAL_PAUSE_MIN_TICKS = 15;
 
-        // Define constants
+        // Minimum time held in an OVP pause, in fault-monitor ticks. 5 * 2 s = 10 s.
+        static constexpr uint16_t OVP_PAUSE_MIN_TICKS = 5;
+
+        // Power levels are PTH steps into the DAC: 0 = 400 mV, 12 = 1600 mV.
         static constexpr uint8_t MIN_POWER_LEVEL = 0;
-        static constexpr uint8_t STABILITY_THRESHOLD = 10; // Number of consecutive stable readings
-        static constexpr uint8_t MAX_FINE_TUNE_STEPS = 2;  // Maximum additional steps for fine tuning
-        static constexpr uint8_t MAX_COUNT_TOGGLING = 3;   // Maximum toggle counting after stable PGOOG
+
+        // Sentinel for "no bound observed yet". Not a reachable power level.
+        static constexpr uint8_t LEVEL_INVALID = 0xFF;
+
+        // Where the closed loop starts once BLE telemetry is available, and where
+        // the open-loop cold-start attempt begins. Mid-range: high enough to wake a
+        // drained IPG, low enough not to drive VRECT straight into OVP.
+        static constexpr uint8_t COLD_START_LEVEL = 7;
+
+        // Passed to SetPulseWidthThresholdStep() to request maximum power. Out of
+        // range on purpose - the HAL clamps anything above the maximum step to
+        // VoltageMaxPulseWidthThreshold_mV (hal_wpt.cpp), so this cannot overshoot.
+        static constexpr uint8_t LEVEL_REQUEST_MAX = 0xFE;
+
+        // Consecutive PGOOD=0 control cycles required before stepping power up.
+        // Rejects single-sample dropouts without delaying a real insufficiency by
+        // more than one cycle.
+        static constexpr uint8_t PGOOD_LOW_CONFIRM = 2;
+
+        // Control cycles skipped after a fault resume. When the IPG comes back from
+        // its own PAUSED state, VCHG needs a moment to recover, so PGOOD reads 0
+        // with OVP already cleared - which is exactly the "step up" condition and
+        // would drive us straight back into the fault.
+        static constexpr uint8_t BLANK_CYCLES_AFTER_FAULT = 1;
+
+        // How long the cold-start attempt stays at COLD_START_LEVEL before
+        // escalating to maximum power for the rest of the scan window.
+        static constexpr uint32_t COLD_START_ESCALATE_MS = 5000;
 
         /// Construct WptManager
         WptManager();
@@ -141,10 +193,22 @@ namespace svc
         /// @param xTimer Handle to the timer
         static void StatusTimeoutMonitoring(TimerHandle_t xTimer);
 
-        // Callback function for the status of temperature and pgood signal
+        /// Callback for the fast fault timer: samples IPG temperature and OVP.
         ///
         /// @param xTimer Handle to the timer
-        static void StatusTempPgoodMonitoring(TimerHandle_t xTimer);
+        static void FaultMonitoring(TimerHandle_t xTimer);
+
+        /// Callback for the slow power control timer: runs the search for the
+        /// minimum viable power level.
+        ///
+        /// @param xTimer Handle to the timer
+        static void PowerControlMonitoring(TimerHandle_t xTimer);
+
+        /// Callback for the cold-start escalation timer: raises power to maximum
+        /// if no IPG advertisement has been seen yet.
+        ///
+        /// @param xTimer Handle to the timer
+        static void ColdStartEscalate(TimerHandle_t xTimer);
 
         /// This method configures the GPIOs.
         void ConfigureGpios();
@@ -159,39 +223,73 @@ namespace svc
                                                  uint16_t get_therm_out,
                                                  uint16_t get_therm_ofst);
 
-        /// Processes the new themal parameters get through BLE data
+        /// Evaluates the IPG temperature from BLE data and drives the thermal
+        /// pause/resume hysteresis.
         static void IpgTemperatureMonitoring(void);
 
-        /// Processes the new pgood parameter get through BLE data
-        static void IpgPgoodMonitoring(void);
+        /// Evaluates the IPG OVP flags from BLE data and drives the OVP
+        /// pause/back-off handling.
+        static void IpgOvpMonitoring(void);
 
-        /// Reset all PGOOD state machine variables to their default values
-        static void ResetPgoodMonitoringStateMachine();
+        /// Resets the power search back to its initial state.
+        static void ResetPowerControl();
 
-        // Sets the power level for wireless power transmission
-        //
-        // @param level The power level to set (0 to MAXIMUM)
+        /// True when the observed OVP ceiling sits at or below the observed PGOOD
+        /// floor, i.e. no power level can satisfy the IPG without faulting it.
+        static bool IsPowerWindowEmpty();
+
+        /// Applies a power level and records it as the current level.
+        ///
+        /// @param level The power level to set (MIN_POWER_LEVEL to maximum step)
         static void SetPowerLevel(uint8_t level);
 
         static eda::Timer mStatusTimer;
 
         static eda::Timer mStatusTimeoutTimer;
 
-        static eda::Timer mTempPgoodTimer;
+        static eda::Timer mFaultTimer;
+
+        static eda::Timer mPowerCtrlTimer;
+
+        static eda::Timer mColdStartEscalateTimer;
 
         hal::Dac80504 DacHalInstance;
 
         hal::Wpt_LTC4125 WptHalInstance;
 
-        bool static m_is_high_temperature_threshold_exceeded;
+        // Bitmask of PauseReason_e. Coil output is enabled only while this is zero.
+        static uint8_t m_pause_reasons;
 
-        static PgoodState pgood_st_machine_current_state;
-        static uint8_t pgood_st_machine_current_power_level;
-        static uint8_t pgood_st_machine_stable_power_level;
-        static uint8_t pgood_st_machine_unstability_toggle_count;
-        static uint8_t pgood_st_machine_stability_counter;
-        static uint8_t pgood_st_machine_fine_tune_attempts;
-        static bool pgood_st_machine_last_pgood_status;
+        // Time held in each pause, counted in fault-monitor ticks.
+        static uint16_t m_thermal_pause_ticks;
+        static uint16_t m_ovp_pause_ticks;
+
+        // Current PTH step.
+        static uint8_t m_level;
+
+        // Set once the descent has found the lowest level the IPG still accepts.
+        // From then on the level only ratchets up, until a thermal pause re-arms
+        // the search.
+        static bool m_floor_found;
+
+        // Lowest level observed to trip an IPG OVP fault, and highest level
+        // observed to be insufficient for PGOOD. LEVEL_INVALID until seen.
+        static uint8_t m_ovp_ceiling;
+        static uint8_t m_pgood_floor;
+
+        // Control cycles still to be skipped after a fault resume.
+        static uint8_t m_blank_cycles;
+
+        // Consecutive PGOOD=0 control cycles observed.
+        static uint8_t m_pgood_low_count;
+
+        // Advertisement counter seen at the last control cycle, used to skip a
+        // cycle when no fresh IPG telemetry has arrived since the last decision.
+        static uint32_t m_last_adv_count;
+
+        // False until the first control cycle with real BLE data, which forces the
+        // level to COLD_START_LEVEL regardless of where cold start left it.
+        static bool m_loop_initialized;
     };
 }
 

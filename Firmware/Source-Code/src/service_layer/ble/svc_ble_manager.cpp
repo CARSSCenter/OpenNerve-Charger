@@ -18,6 +18,8 @@ namespace svc
 {
     AdvertisementData_t BleManager::mAdvertisementData;
 
+    uint32_t BleManager::mAdvertisementCounter = 0;
+
     eda::Timer BleManager::mTimeoutTimer(TIMER_NAME, SCAN_TIMEOUT_MS, ONESHOT, TimerCallback);
 
     uint32_t BleManager::mScanTimeoutMs = SCAN_TIMEOUT_MS;
@@ -198,6 +200,11 @@ namespace svc
 
             // End code test
             
+
+            // Mark this advertisement as fresh telemetry. Must happen after the
+            // fields above are written, so any consumer that sees a new count is
+            // guaranteed to see the data that came with it.
+            mAdvertisementCounter++;
 
             uint32_t optDataAddress = reinterpret_cast<uint32_t>(&mAdvertisementData);
 

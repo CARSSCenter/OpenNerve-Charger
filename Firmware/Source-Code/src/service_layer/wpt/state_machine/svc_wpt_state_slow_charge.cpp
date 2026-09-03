@@ -82,6 +82,21 @@ namespace svc
             WptPort::SendEvent(WptPort::Event_e::WPT_POWER_OFF, NULL);
             break;
         }
+        case WptPort::Event_e::WPT_FAULT_PAUSE:
+        {
+            // The fault timers also run while scanning/slow-charging, so a trip can
+            // arrive here and not only in StateCharging. No state change, same as
+            // there - the coil stops, monitoring does not.
+            LOG_WARNING("WPT State Machine SlowCharge state: Fault pause - suspending power transfer\n");
+            mWptManager.PauseWpt(static_cast<uint8_t>(optDataAddress));
+            break;
+        }
+        case WptPort::Event_e::WPT_FAULT_RESUME:
+        {
+            LOG_INFO("WPT State Machine SlowCharge state: Fault resume - restoring power transfer\n");
+            mWptManager.ResumeWpt(static_cast<uint8_t>(optDataAddress));
+            break;
+        }
         default:
         {
             //ASSERT(false);
