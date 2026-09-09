@@ -292,7 +292,7 @@ namespace svc
         // Calculate thermistor resistance
         float resistance = voltage / current; // in kΩ
 
-        LOG_INFO("WPT Manager: IPG thermal resistance: %d", resistance);
+        LOG_INFO("WPT Manager: IPG thermistor resistance: %d", resistance);
 
         // Handle out of range values first
         if (resistance >= TEMP_LOOKUP_TABLE[0].resistance)
