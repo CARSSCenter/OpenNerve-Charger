@@ -297,12 +297,16 @@ namespace svc
 
         // Printed every fault tick in manual mode. When the coil is commanded on
         // but PGOOD is 0, this line is what separates "the IPG shut itself down"
-        // from "the command did not take effect".
-        LOG_WARNING("[MANUAL] IPG bits: VRECT_DETn=%d VRECT_OVPn=%d PGOOD=%d CHG1=%d CHG2=%d\n",
+        // from "the command did not take effect". Raw levels: every "n" name is
+        // active-low (0 = asserted). NRF_LOG takes at most six arguments, so
+        // CHG1_STATUS - 1 in every state seen on this hardware - is left to the
+        // per-advertisement dump in ProcessNewBleData().
+        LOG_WARNING("[MANUAL] IPG bits: VRECT_DETn=%d VRECT_OVPn=%d CHG1_OVP_ERRn=%d CHG2_OVP_ERRn=%d PGOOD=%d CHG2=%d\n",
                     p.GET_VRECT_DET,
                     p.GET_VRECT_OVP,
+                    p.GET_CHG1_OVP_ERR,
+                    p.GET_CHG2_OVP_ERR,
                     p.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD,
-                    p.GET_CHG1_STATUS,
                     p.GET_CHG2_STATUS);
     }
 

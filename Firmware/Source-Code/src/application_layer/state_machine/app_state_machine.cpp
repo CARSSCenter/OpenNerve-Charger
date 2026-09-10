@@ -69,13 +69,15 @@ namespace app
         LOG_INFO("StateMachine: New IPG data received");
 
         LOG_INFO("Charging Parameters:");
-        LOG_INFO("  Vrect detection: %d", ChargingStatusParameters.GET_VRECT_DET);
-        LOG_INFO("  Vrect OVP: %d", ChargingStatusParameters.GET_VRECT_OVP);
+        // Raw pin levels as the IPG sent them. Every name ending in "n" is
+        // active-low: 1 = OK/absent, 0 = asserted.
+        LOG_INFO("  VRECT_DETn: %d (0 = coil present)", ChargingStatusParameters.GET_VRECT_DET);
+        LOG_INFO("  VRECT_OVPn: %d (1 = OK, 0 = OVP)", ChargingStatusParameters.GET_VRECT_OVP);
         LOG_INFO("  Vchg rail supply circuit power good: %d",
                  ChargingStatusParameters.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD);
-        LOG_INFO("  CHG1 status: %d, OVP error: %d",
+        LOG_INFO("  CHG1 status: %d, CHG1_OVP_ERRn: %d (1 = OK, 0 = OVP)",
                  ChargingStatusParameters.GET_CHG1_STATUS, ChargingStatusParameters.GET_CHG1_OVP_ERR);
-        LOG_INFO("  CHG2 status: %d, OVP error: %d",
+        LOG_INFO("  CHG2 status: %d, CHG2_OVP_ERRn: %d (1 = OK, 0 = OVP)",
                  ChargingStatusParameters.GET_CHG2_STATUS, ChargingStatusParameters.GET_CHG2_OVP_ERR);
 
         LOG_INFO("Thermal Parameters:");

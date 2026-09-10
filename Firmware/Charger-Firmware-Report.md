@@ -450,7 +450,7 @@ index+27          msd[23] Hardware version
 | 6 | `CHG2_OVP_ERRn` | Active-low | Battery B OVP OK |
 | 7 | `ENG2_SDNn` | Active-low | ENG2 enabled |
 
-> ⚠️ **The parser stores these as raw bits, not normalized booleans.** `GET_VRECT_OVP`, `GET_CHG1_OVP_ERR`, and `GET_CHG2_OVP_ERR` hold the bit exactly as received (`svc_ble_manager.cpp:182,185,187`), so for all three an **asserted fault is 0, not 1**. A natural-looking `if (params.GET_VRECT_OVP)` is inverted and will trip on every healthy advertisement. Only `GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD` (bit 2) is active-high and reads the way its name suggests.
+> ⚠️ **The parser stores these as raw bits, not normalized booleans.** `GET_VRECT_OVP`, `GET_CHG1_OVP_ERR`, and `GET_CHG2_OVP_ERR` hold the bit exactly as received (`svc_ble_manager.cpp:182,185,187`), so for all three an **asserted fault is 0, not 1**. A natural-looking `if (params.GET_VRECT_OVP)` is inverted and will trip on every healthy advertisement. Only `GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD` (bit 2) is active-high and reads the way its name suggests. Verified end-to-end on 2026-09-10: the IPG packs each pin's level unmodified (`setBitFromGpioState`, `app_mode_ble_active.c:26-47`), the pins are inputs with internal pull-ups (`gpio.c:150-154`, `273-277`), and the two `== 0` compares in `IpgOvpMonitoring()` are the only inversion between the IPG pin and the charger's decision.
 
 **Thermistor bytes** are in units of 10 mV; the parser multiplies by 10 to produce mV for `CalculateTemperatureFromBle()`. Note the IPG clamps each to 0xFF before transmitting (`app_mode_ble_active.c:137-139`), giving a ceiling of 2550 mV, and the 10 mV quantization is ±~0.6 °C at the charger — appreciable against the 2 °C thermal hysteresis band.
 
@@ -585,7 +585,7 @@ Every automatic path starts and stops them together through `StartIpgTemperature
 
 | Observation | Meaning | Action |
 |-------------|---------|--------|
-| OVP asserted | Too much power | Down — handled by the fault path, §6.6 |
+| `VRECT_OVPn` asserted | Too much power | Down — handled by the fault path, §6.6 |
 | PGOOD = 0, no OVP | Too little power | Up one step |
 | PGOOD = 1, floor not yet found | Possibly overpowered | Down one step |
 | PGOOD = 1, floor found | At the minimum viable level | Hold |
@@ -689,24 +689,43 @@ The pre-2026-09 charger assumed the first reading and increased power, which rai
 **Charger-side handling** (`IpgOvpMonitoring()`, 2 s fault timer):
 
 ```cpp
-// Raw active-low bits: 0 = asserted. See the warning in §5.3.
-const bool ovp_active = (p.GET_VRECT_OVP == 0) || (p.GET_CHG2_OVP_ERR == 0);
+// Raw active-low bits: 1 = OK, 0 = asserted. See the warning in §5.3.
+const bool vrect_ovp = (p.GET_VRECT_OVP == 0);     // acts: pause, ceiling, step-down
+const bool chg1_ovp  = (p.GET_CHG1_OVP_ERR == 0);  // logged on change only
+const bool chg2_ovp  = (p.GET_CHG2_OVP_ERR == 0);  // logged on change only
 ```
 
 | Step | Action |
 |------|--------|
-| On assert | Record `m_ovp_ceiling = min(ceiling, m_level)`, then `WPT_FAULT_PAUSE(PAUSE_OVP)` |
+| New advertisement, `VRECT_OVPn` = 0 | `m_ovp_ceiling = min(ceiling, fault_level)`, then `WPT_FAULT_PAUSE(PAUSE_OVP)` |
+| New advertisement, a `CHGx_OVP_ERRn` changed | Log it — WARNING on assert, INFO on clear, with level and PGOOD. Coil unaffected |
+| Same advertisement as last tick | Ignored — only fresh telemetry can report a new fault |
 | Dwell < 10 s (`OVP_PAUSE_MIN_TICKS = 5`) | Hold |
-| Dwell ≥ 10 s, OVP still asserted | Hold, log at WARNING |
-| Dwell ≥ 10 s, OVP cleared | Step level down one, set `m_blank_cycles`, `WPT_FAULT_RESUME(PAUSE_OVP)` |
+| Dwell ≥ 10 s, `VRECT_OVPn` still 0 | Hold, log at WARNING |
+| Dwell ≥ 10 s, `VRECT_OVPn` cleared | Step level down one, set `m_blank_cycles`, `WPT_FAULT_RESUME(PAUSE_OVP)` |
 
-`CHG1_OVP_ERR` is deliberately **not** part of the trip condition — `CHG1_STATUS` reads 1 in every state observed on this hardware and CHG2 is the battery actually being charged, so including CHG1 would add noise without signal. It is logged for diagnostics only.
+**The bits are different kinds of fault** (IPG Gen2 schematic, sheets 5 and 6):
+
+| Bit | Circuit | What it measures | Charger response |
+|-----|---------|------------------|------------------|
+| `VRECT_OVPn` | FET U507B gated by VRECT/17 (R510 1.6 MΩ / R512 100 kΩ), drain pulled up to DVDD by R514 1 MΩ. Not gated by `VRECT_MON_EN` | Rectifier over-voltage — caused by too much coil power | Pause, **set ceiling**, step down on resume |
+| `CHG1_OVP_ERRn`, `CHG2_OVP_ERRn` | TLV4021 U601 / U603 on VBAT1CHG / VBAT2CHG (trips at 4.277 V) driving FET U613B / U615B; the same comparator output opens U612A / U614A, disconnecting that battery in hardware | Battery-node over-voltage — not a function of PTH level | **Logged on change only** — no pause, no ceiling, no step-down |
+
+**Why the battery OVP flags are log-only (2026-09-10).** The LTC4065 regulates its own 4.2 V float regardless of input power, so no PTH level can clear a genuine battery OVP — and the hardware has already disconnected that battery. The comparator is powered from +VCHG_RAIL while its output pull-up (R612 for battery B) goes to VBATxCHG, so its output is not guaranteed while that rail is collapsed — which is exactly the PGOOD = 0 condition at low power, and during every IPG pause. If the IPG's own converter shutdown leaves the coil's energy nowhere to go, VRECT rises and `VRECT_OVPn` brings the charger in through the rectifier path. Before 2026-09-10 a `CHG2_OVP_ERRn` reading paused the coil for at least 10 s and set the ceiling at whatever level was in force; since the ceiling never rises within a session, one such reading could cap power, or force the "no viable power level" clamp, for the rest of the session. Each log line carries PGOOD: a flag that only ever asserts with PGOOD = 0 points at the rail collapse rather than a real over-voltage.
+
+**Attribution — which level a fault is charged to.** IPG telemetry lags the PTH level by up to ~3 s: the IPG samples its pins once a second, and the fault timer reads the latest advertisement every 2 s. A fault is therefore charged to `fault_level`, the highest level applied during the current or previous fault tick (`m_level_max_this_tick` / `m_level_max_last_tick`, fed by `SetPowerLevel()`), not to the level in force when it is read. Before 2026-09-10 it was charged to the level at read time, so a step down taken just before the read — the closed loop's first cycle pulling cold-start maximum (12) back to 7, or a manual `-` after an OVP warning — pinned the ceiling on a level that never faulted. Erring high is self-correcting (the step below re-trips and lowers the ceiling); erring low is not.
+
+**Freshness.** A fault is acted on only when it arrives in a new advertisement (`m_ovp_last_adv_count`, deliberately not reset between sessions). Previously the same advertisement was re-evaluated every tick, so in manual mode — where nothing pauses — one stale OVP reading was re-charged to each new level as it was selected.
+
+Both battery flags are reported only when they change, so a flag stuck asserted produces one line per session rather than one per advertisement; `ResetPowerControl()` clears the logged state so the next session reports it again. (The IPG itself still pauses its converter on both: its battery-present qualifier is inert because `WPT_BATT_ABSENT_THRESHOLD_MV` has been `0` since IPG commit `8e41480`, 2026-05-22, and its resume condition ignores `CHGx_OVP_ERRn`.)
+
+**Logging.** Every OVP log prints the raw bits under their active-low names — `VRECT_OVPn=0` is a fault. The pre-2026-09-10 fault line printed normalized booleans (`vrect=1` meant fault) alongside raw-bit dumps elsewhere that use the opposite sense.
 
 **Why the blanking cycle exists.** When the IPG re-enables, its VCHG rail needs a moment to recover, so for one or two samples PGOOD reads 0 while OVP has already cleared. That is precisely the "add power" condition, and acting on it would undo the back-off and re-trip the fault immediately. `BLANK_CYCLES_AFTER_FAULT` makes the power loop skip a cycle after any fault resume.
 
-**Timing note.** The charger's 10 s pause is longer than the IPG's own 5 s hold, so the IPG re-enables first. This is safe: the charger's coil is off throughout its pause, VRECT is at zero, and OVP is therefore guaranteed clear by the time the charger resumes one step lower. It is more conservative than the handshake strictly requires — the IPG's stated expectation is a *power reduction*, not a coil shutdown — at the cost of ~10 s of charging per trip.
+**Timing note.** The charger's 10 s pause is longer than the IPG's own 5 s hold, so the IPG re-enables first. This is safe: the charger's coil is off throughout its pause, VRECT is at zero, and `VRECT_OVPn` is therefore guaranteed clear by the time the charger resumes (one step lower after a rectifier OVP). It is more conservative than the handshake strictly requires — the IPG's stated expectation is a *power reduction*, not a coil shutdown — at the cost of ~10 s of charging per trip.
 
-**In debug-build manual mode (§4.7)** OVP is still detected and `m_ovp_ceiling` is still recorded, but the charger neither pauses nor steps down; it logs `[MANUAL] WARN ovp: … ignored` instead. The IPG's own response is unaffected — it still sets `VCHG_DISABLE`, so PGOOD still drops. That is why manual mode prints the raw IPG fault bits on every fault tick: it is the only way to tell an IPG protecting itself from a command that did not take effect.
+**In debug-build manual mode (§4.7)** OVP is still detected and a rectifier OVP still records `m_ovp_ceiling`, but the charger neither pauses nor steps down; it logs `[MANUAL] WARN ovp: VRECT_OVPn=0 at level …, charged to …, ceiling …, ignored` instead. The IPG's own response is unaffected — it still sets `VCHG_DISABLE`, so PGOOD still drops. That is why manual mode prints the raw IPG fault bits, including `CHG1_OVP_ERRn` and `CHG2_OVP_ERRn`, on every fault tick: it is the only way to tell an IPG protecting itself from a command that did not take effect.
 
 ---
 
@@ -884,6 +903,32 @@ callback sends `WPT_SCAN_TIMEOUT` if `GetStat() == 1`, and `StateCharging` answe
 
 **Status (2026-09-10).** Documenting the `StateManual` design turned up four defects by inspection: three entry paths that did not meet the "coil off, monitoring on" contract, and a stale console flag after leaving with Button 1. The same day, manual mode was changed to override every operational state explicitly — stopping any charge in progress and idling until `s` — with entry routed through `WPT_MANUAL_IDLE`, Button 1 disabled, and the flag owned by the state (§4.7). Both flag states compile clean across all 53 first-party sources. Not yet run on hardware; the only hardware run so far was the flag-based first cut described above.
 
+
+### 8.5 — 2026-09-10 OVP polarity audit and false-ceiling fix
+
+**Trigger.** Bench logs showed an OVP-based ceiling being recorded while the IPG board showed no over-voltage.
+
+**Polarity: correct, no change needed.** Every active-low bit is compared `== 0` for "asserted", and the IPG packs raw pin levels (§5.3).
+
+**Causes found and fixed** (all in `IpgOvpMonitoring()`, §6.6):
+
+| # | Defect | Fix |
+|---|--------|-----|
+| 1 | `CHG2_OVP_ERRn` — a battery-node comparator — paused the coil, set the PTH ceiling and earned a step down | `CHG1_OVP_ERRn` and `CHG2_OVP_ERRn` are logged on change only; `VRECT_OVPn` alone pauses, sets the ceiling and steps down |
+| 2 | Faults charged to the level in force when read, though telemetry lags ~3 s | Charged to the highest level applied over the last two fault ticks |
+| 3 | The same advertisement re-evaluated every tick | Faults acted on only from a new advertisement |
+| 4 | Fault log printed normalized booleans (`vrect=1` = fault) beside raw-bit dumps | All logs print raw bits under `…n` names; `[MANUAL] IPG bits` now includes both battery OVP bits (drops `CHG1_STATUS` for NRF_LOG's six-argument limit) |
+
+| File | Change |
+|------|--------|
+| `src/service_layer/wpt/svc_wpt_manager.{h,cpp}` | `IpgOvpMonitoring()` reworked; `RecordOvpCeiling()`; `m_ovp_last_adv_count`, `m_chg1_ovp_logged` / `m_chg2_ovp_logged`, `m_level_max_this_tick` / `m_level_max_last_tick`; `SetPowerLevel()` feeds the window, `ResetPowerControl()` resets it |
+| `src/application_layer/state_machine/app_state_machine.cpp` | Per-advertisement dump labels the raw bits with their polarity |
+| `src/service_layer/debug/svc_debug_console.cpp` | `LogIpgBits()` prints `CHG1_OVP_ERRn` and `CHG2_OVP_ERRn` |
+
+**Battery OVP flags made log-only (same day).** A first cut kept `CHG2_OVP_ERRn` as a coil pause without a ceiling. Since U612A/U614A already disconnect the battery in hardware and coil power cannot clear a genuine battery OVP, both `CHGx_OVP_ERRn` flags were then made log-only at the user's request.
+
+**Status.** Both flag states compile clean across all 53 first-party sources. Not yet run on hardware. Scoping `CHG2.OVP_ERRn` (TP626) against +VCHG_RAIL at low PTH would confirm or rule out the rail-collapse false assert.
+
 ---
 
 ## 9. Event Flow — Complete Happy Path
@@ -910,7 +955,7 @@ IPG advertisement received (company ID 0xF0F0)
   → StateCharging::Entry(): mWptManager.EnableWpt() (WPT_EN LOW, starts status timers)
 
 Every 2 s (mFaultTimer): IpgOvpMonitoring() + IpgTemperatureMonitoring()
-  → OVP asserted:  record ovp_ceiling, WPT_FAULT_PAUSE(PAUSE_OVP)
+  → VRECT_OVPn=0:  record ovp_ceiling, WPT_FAULT_PAUSE(PAUSE_OVP)   (CHGx_OVP_ERRn: logged only)
                    after 10 s and clear: step down one, resume
   → temp ≥ 41°C:   WPT_FAULT_PAUSE(PAUSE_THERMAL)
                    after 30 s and ≤ 39°C: resume, re-arm the floor search

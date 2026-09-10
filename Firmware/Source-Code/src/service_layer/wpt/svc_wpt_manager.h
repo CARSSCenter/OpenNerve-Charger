@@ -312,6 +312,10 @@ namespace svc
         /// floor, i.e. no power level can satisfy the IPG without faulting it.
         static bool IsPowerWindowEmpty();
 
+        /// Charges a rectifier OVP fault to a power level, keeping the lowest
+        /// level that has ever faulted as m_ovp_ceiling.
+        static void RecordOvpCeiling(uint8_t level);
+
         /// Applies a power level and records it as the current level.
         ///
         /// @param level The power level to set (MIN_POWER_LEVEL to maximum step)
@@ -368,6 +372,30 @@ namespace svc
         // False until the first control cycle with real BLE data, which forces the
         // level to COLD_START_LEVEL regardless of where cold start left it.
         static bool m_loop_initialized;
+
+        // Advertisement counter seen at the last OVP evaluation; a fault is acted
+        // on only when it arrives in a new advertisement. Deliberately not reset by
+        // ResetPowerControl(): the counter only grows, and keeping it means the
+        // last advertisement of a previous session is never mistaken for fresh.
+        static uint32_t m_ovp_last_adv_count;
+
+        // Last CHG1/CHG2_OVP_ERRn state that was logged (true = asserted). The
+        // battery OVP flags are log-only, so they are reported on change rather
+        // than on every advertisement.
+        static bool m_chg1_ovp_logged;
+        static bool m_chg2_ovp_logged;
+
+        // Highest level applied during the current and the previous fault tick.
+        // IPG telemetry lags the level by up to ~3 s (1 s IPG sampling plus the 2 s
+        // fault tick), so a rectifier fault is charged to the highest level applied
+        // over that window, not to whatever level is in force when it is read.
+        // Otherwise a step down taken just before the fault is read - by the power
+        // loop, the cold-start handover or a manual '-' - pins the ceiling on a
+        // level that never faulted. Erring high is self-correcting (the level just
+        // below re-trips and lowers the ceiling); erring low is not, because the
+        // ceiling never rises again within a session.
+        static uint8_t m_level_max_this_tick;
+        static uint8_t m_level_max_last_tick;
     };
 }
 

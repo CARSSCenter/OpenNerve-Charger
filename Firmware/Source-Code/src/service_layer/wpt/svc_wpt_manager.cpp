@@ -31,6 +31,11 @@ namespace svc
     uint8_t WptManager::m_pgood_low_count = 0;
     uint32_t WptManager::m_last_adv_count = 0;
     bool WptManager::m_loop_initialized = false;
+    uint32_t WptManager::m_ovp_last_adv_count = 0;
+    bool WptManager::m_chg1_ovp_logged = false;
+    bool WptManager::m_chg2_ovp_logged = false;
+    uint8_t WptManager::m_level_max_this_tick = WptManager::COLD_START_LEVEL;
+    uint8_t WptManager::m_level_max_last_tick = WptManager::COLD_START_LEVEL;
 
     WptManager &WptManager::Instance()
     {
@@ -443,41 +448,89 @@ namespace svc
 
     void WptManager::IpgOvpMonitoring(void)
     {
+        // Rotate the fault-attribution window first, on every tick and before any
+        // early return, so it always spans exactly the current and previous tick.
+        const uint8_t fault_level = (m_level_max_this_tick > m_level_max_last_tick)
+                                        ? m_level_max_this_tick
+                                        : m_level_max_last_tick;
+        m_level_max_last_tick = m_level_max_this_tick;
+        m_level_max_this_tick = m_level;
+
+        const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
+
         // mAdvertisementData is zero-initialised and the IPG's fault bits are
         // active-low, so before the first advertisement every fault reads as
         // asserted. Without this guard the charger pauses for OVP at every startup.
-        if (svc::BleManager::GetAdvertisementCount() == 0)
+        if (adv_count == 0)
         {
             return;
         }
 
+        // Only a new advertisement can report a new fault. Re-reading the same one
+        // on the next tick would charge an old fault to whatever level is in force
+        // by then - and after scanning stops, to every level for the rest of the
+        // session.
+        const bool fresh = (adv_count != m_ovp_last_adv_count);
+        m_ovp_last_adv_count = adv_count;
+
         const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
         const svc::ChargingStatusParameters_t &p = advData.chargingStatusParameters;
 
-        // Raw active-low bits straight from the IPG MSD GPIO byte: 0 = asserted.
-        // CHG1 is excluded deliberately - CHG1_STATUS reads 1 in every state
-        // observed on this hardware and CHG2 is the battery actually being charged,
-        // so gating on CHG1_OVP_ERR would add noise without signal. Logged only.
+        // Raw active-low bits straight from the IPG MSD GPIO byte: 1 = OK,
+        // 0 = asserted. The IPG packs the pin level unmodified
+        // (setBitFromGpioState in app_mode_ble_active.c), so these compares are
+        // the only inversion anywhere between the IPG pin and this decision.
+        //
+        // Only VRECT_OVPn acts. It is a FET threshold on VRECT/17 - the rectifier
+        // voltage the coil produces - and so the only fault that coil power causes
+        // and that reducing coil power can clear.
+        //
+        // CHGx_OVP_ERRn are logged and nothing more. Each is a battery-node
+        // comparator (VBATxCHG >= 4.277 V) that disconnects its battery in hardware
+        // by itself, and the IPG additionally pauses its own converter on it. The
+        // LTC4065 holds its float voltage regardless of input power, so no PTH
+        // level can clear a genuine battery OVP; and the comparator runs from
+        // VCHG_RAIL, so its output is not guaranteed while that rail is collapsed
+        // (PGOOD = 0) - pausing on it caused spurious pauses at low power. If the
+        // IPG's converter shutdown leaves the coil with nowhere to put its energy,
+        // VRECT rises and VRECT_OVPn brings the charger in through the path above.
         const bool vrect_ovp = (p.GET_VRECT_OVP == 0);
+        const bool chg1_ovp = (p.GET_CHG1_OVP_ERR == 0);
         const bool chg2_ovp = (p.GET_CHG2_OVP_ERR == 0);
-        const bool ovp_active = vrect_ovp || chg2_ovp;
+
+        if (fresh && ((chg1_ovp != m_chg1_ovp_logged) || (chg2_ovp != m_chg2_ovp_logged)))
+        {
+            // Logged on change only - these never alter the coil, so a line per
+            // advertisement would be noise. PGOOD is included because a flag that
+            // asserts only while PGOOD = 0 points at the VCHG_RAIL collapse rather
+            // than a real battery over-voltage.
+            if (chg1_ovp || chg2_ovp)
+            {
+                LOG_WARNING("WPT Manager: IPG battery OVP flag asserted (CHG1_OVP_ERRn=%d CHG2_OVP_ERRn=%d, 0 = fault) at level %d, PGOOD=%d - logged only, coil unaffected\n",
+                            p.GET_CHG1_OVP_ERR, p.GET_CHG2_OVP_ERR, m_level,
+                            p.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD);
+            }
+            else
+            {
+                LOG_INFO("WPT Manager: IPG battery OVP flags cleared (CHG1_OVP_ERRn=%d CHG2_OVP_ERRn=%d) at level %d, PGOOD=%d\n",
+                         p.GET_CHG1_OVP_ERR, p.GET_CHG2_OVP_ERR, m_level,
+                         p.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD);
+            }
+
+            m_chg1_ovp_logged = chg1_ovp;
+            m_chg2_ovp_logged = chg2_ovp;
+        }
 
         const bool ovp_paused = (m_pause_reasons & PAUSE_OVP) != 0;
 
         if (!ovp_paused)
         {
-            if (!ovp_active)
+            if (!fresh || !vrect_ovp)
             {
                 return;
             }
 
-            // Remember the lowest level that has ever faulted. Without this the
-            // "PGOOD is low, add power" rule walks straight back into the level we
-            // just tripped on, and the two controllers oscillate indefinitely.
-            if (m_ovp_ceiling == LEVEL_INVALID || m_level < m_ovp_ceiling)
-            {
-                m_ovp_ceiling = m_level;
-            }
+            RecordOvpCeiling(fault_level);
 
 #if WPT_MANUAL_DEBUG_MODE
             // Warn only. The ceiling above is still recorded, so a later return to
@@ -485,14 +538,14 @@ namespace svc
             // the coil and nothing steps the level down.
             if (DebugConsole::IsManual())
             {
-                LOG_WARNING("[MANUAL] WARN ovp: asserted at level %d (vrect=%d chg2=%d), ceiling %d noted, ignored\n",
-                            m_level, vrect_ovp, chg2_ovp, m_ovp_ceiling);
+                LOG_WARNING("[MANUAL] WARN ovp: VRECT_OVPn=0 at level %d, charged to %d, ceiling %d, ignored\n",
+                            m_level, fault_level, m_ovp_ceiling);
                 return;
             }
 #endif
 
-            LOG_ERROR("WPT Manager: IPG OVP asserted at level %d (vrect=%d chg2=%d chg1=%d), ceiling now %d, pausing",
-                      m_level, vrect_ovp, chg2_ovp, (p.GET_CHG1_OVP_ERR == 0), m_ovp_ceiling);
+            LOG_ERROR("WPT Manager: IPG rectifier OVP (VRECT_OVPn=0) at level %d, charged to %d, ceiling %d, pausing",
+                      m_level, fault_level, m_ovp_ceiling);
 
             m_ovp_pause_ticks = 0;
             WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
@@ -507,9 +560,9 @@ namespace svc
             return;
         }
 
-        if (ovp_active)
+        if (vrect_ovp)
         {
-            LOG_WARNING("WPT Manager: IPG OVP still asserted after %d ticks, staying paused\n", m_ovp_pause_ticks);
+            LOG_WARNING("WPT Manager: VRECT_OVPn still 0 after %d ticks, staying paused\n", m_ovp_pause_ticks);
             return;
         }
 
@@ -526,7 +579,7 @@ namespace svc
         // condition, which would undo the back-off - so skip a control cycle.
         m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
 
-        LOG_INFO("WPT Manager: IPG OVP cleared after %d ticks, resuming one step down at level %d\n",
+        LOG_INFO("WPT Manager: VRECT_OVPn cleared after %d ticks, resuming one step down at level %d\n",
                  m_ovp_pause_ticks, m_level);
 
         WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
@@ -575,8 +628,25 @@ namespace svc
         m_pgood_low_count = 0;
         m_last_adv_count = 0;
         m_loop_initialized = false;
+        // Forget the logged battery OVP state so a flag still asserted when the
+        // next session starts is reported again there.
+        m_chg1_ovp_logged = false;
+        m_chg2_ovp_logged = false;
+        m_level_max_this_tick = COLD_START_LEVEL;
+        m_level_max_last_tick = COLD_START_LEVEL;
 
         LOG_INFO("WPT Manager: Power control reset, level %d\n", m_level);
+    }
+
+    void WptManager::RecordOvpCeiling(uint8_t level)
+    {
+        // Remember the lowest level that has ever faulted. Without this the
+        // "PGOOD is low, add power" rule walks straight back into the level we
+        // just tripped on, and the two controllers oscillate indefinitely.
+        if (m_ovp_ceiling == LEVEL_INVALID || level < m_ovp_ceiling)
+        {
+            m_ovp_ceiling = level;
+        }
     }
 
     bool WptManager::IsPowerWindowEmpty()
@@ -730,6 +800,13 @@ namespace svc
         }
 
         m_level = level;
+
+        // Feed the OVP attribution window (see m_level_max_this_tick). Only ever
+        // raised here; IpgOvpMonitoring() rotates it on every fault tick.
+        if (level > m_level_max_this_tick)
+        {
+            m_level_max_this_tick = level;
+        }
 
         WptPort::SendEventFromISR(WptPort::Event_e::WPT_ADJUST_POWER, static_cast<uint32_t>(level));
     }
