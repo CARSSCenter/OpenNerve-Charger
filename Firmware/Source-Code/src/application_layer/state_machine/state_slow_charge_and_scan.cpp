@@ -17,6 +17,7 @@
 #include "svc_ble_subsystem.h"
 #include "svc_pmc_port.h"
 #include "svc_pmc_subsystem.h"
+#include "svc_debug_config.h"
 #include "svc_wpt_subsystem.h"
 
 namespace app
@@ -84,6 +85,13 @@ namespace app
             stateMachine->ChangeState(states->pStateWait);
         }
         break;
+#if WPT_MANUAL_DEBUG_MODE
+        case SystemPort::Event_e::MANUAL_TAKEOVER:
+        {
+            stateMachine->ChangeState(states->pStateManual);
+        }
+        break;
+#endif
         case SystemPort::Event_e::BUTTON_DFU_PRESSED:
         {
             if (!hal::Dfu::Instance().is_dfu_active())

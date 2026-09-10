@@ -24,6 +24,9 @@
 namespace app
 {
     SystemStateMachine::SystemStateMachine() : StateMachine("App", &mInitialState), mInitialState(this), mStateCharge(this), mStateScan(this), mStateWait(this), mStateSlowChargeAndScan(this)
+#if WPT_MANUAL_DEBUG_MODE
+        , mStateManual(this)
+#endif
     {
     }
 
@@ -49,6 +52,9 @@ namespace app
         states.pStateScan = &mStateScan;
         states.pStateWait = &mStateWait;
         states.pStateSlowChargeAndScan = &mStateSlowChargeAndScan;
+#if WPT_MANUAL_DEBUG_MODE
+        states.pStateManual = &mStateManual;
+#endif
         return &states;
     }
 

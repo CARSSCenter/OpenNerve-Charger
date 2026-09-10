@@ -57,6 +57,12 @@ namespace app
             BUTTON_PRESSED = 0x10,
 
             BUTTON_DFU_PRESSED = 0x11,
+
+            /// Debug builds only: hand control to StateManual from any state.
+            /// SystemPort::ExecuteEvent dispatches straight to the state machine
+            /// and never indexes mEventCallback, so MAX_EVENT_ENUM_LENGTH does not
+            /// constrain this value the way it does on the BLE and WPT ports.
+            MANUAL_TAKEOVER = 0x12,
         };
 
         static void SendEvent(Event_e eventID, uint32_t optDataAddress)

@@ -82,6 +82,16 @@ namespace svc
             WptPort::SendEvent(WptPort::Event_e::WPT_POWER_OFF, NULL);
             break;
         }
+        case WptPort::Event_e::WPT_ADJUST_POWER:
+        {
+            // Absent until now, so every WPT_ADJUST_POWER that arrived while the
+            // WPT SM sat in this state was silently dropped and the DAC kept its
+            // previous value. Both the automatic loop and the debug console send
+            // this event without knowing which state will receive it.
+            LOG_DEBUG("WPT State Machine SlowCharge state: WPT Adjust Power\n");
+            mWptManager.AdjustWptPowerTransfer(static_cast<uint8_t>(optDataAddress));
+            break;
+        }
         case WptPort::Event_e::WPT_FAULT_PAUSE:
         {
             // The fault timers also run while scanning/slow-charging, so a trip can
@@ -97,6 +107,17 @@ namespace svc
             mWptManager.ResumeWpt(static_cast<uint8_t>(optDataAddress));
             break;
         }
+#if WPT_MANUAL_DEBUG_MODE
+        case WptPort::Event_e::WPT_MANUAL_IDLE:
+        {
+            // Queued by StateManual::Entry() behind anything the previous
+            // application state sent, so this is the last word: coil off, timers
+            // stopped, back to idle until the operator's 's'.
+            mWptManager.EnterManualIdle();
+            stateMachine->ChangeState(states->pStateIdle);
+            break;
+        }
+#endif
         default:
         {
             //ASSERT(false);

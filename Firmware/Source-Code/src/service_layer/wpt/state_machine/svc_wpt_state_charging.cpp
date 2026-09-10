@@ -131,6 +131,17 @@ namespace svc
             mWptManager.ResumeWpt(static_cast<uint8_t>(optDataAddress));
             break;
         }
+#if WPT_MANUAL_DEBUG_MODE
+        case WptPort::Event_e::WPT_MANUAL_IDLE:
+        {
+            // Queued by StateManual::Entry() behind anything the previous
+            // application state sent, so this is the last word: coil off, timers
+            // stopped, back to idle until the operator's 's'.
+            mWptManager.EnterManualIdle();
+            stateMachine->ChangeState(states->pStateIdle);
+            break;
+        }
+#endif
         default:
         {
             break;

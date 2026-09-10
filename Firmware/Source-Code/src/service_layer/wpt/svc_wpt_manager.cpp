@@ -12,12 +12,14 @@
 #include "eda_manager_log_config.h"
 #include "hal_dac.h"
 #include "svc_ble_subsystem.h"
+#include "svc_debug_console.h"
 
 namespace svc
 {
     uint8_t static m_max_power_level;
 
     uint8_t WptManager::m_pause_reasons = 0;
+    bool WptManager::m_coil_enabled = false;
     uint16_t WptManager::m_thermal_pause_ticks = 0;
     uint16_t WptManager::m_ovp_pause_ticks = 0;
 
@@ -116,6 +118,7 @@ namespace svc
         else
         {
             WptHalInstance.Enable();
+            m_coil_enabled = true;
         }
 
         StartStatusTimeoutTimer();
@@ -126,6 +129,7 @@ namespace svc
     void WptManager::DisableWpt()
     {
         WptHalInstance.Disable();
+        m_coil_enabled = false;
         StopStatusMonitoring();
         StopIpgTemperaturePgoodMonitoringTimer();
         mColdStartEscalateTimer.Stop();
@@ -145,6 +149,7 @@ namespace svc
         if (was_running)
         {
             WptHalInstance.Disable();
+            m_coil_enabled = false;
         }
 
         // Deliberately does not touch mFaultTimer or mPowerCtrlTimer: monitoring has
@@ -161,6 +166,7 @@ namespace svc
         if (m_pause_reasons == 0)
         {
             WptHalInstance.Enable();
+            m_coil_enabled = true;
             LOG_INFO("WPT Manager: ResumeWpt reason 0x%02X cleared, coil re-enabled at level %d\n",
                      reason, m_level);
         }
@@ -243,6 +249,28 @@ namespace svc
         mFaultTimer.Start();
         mPowerCtrlTimer.Start();
     }
+
+    void WptManager::StartFaultMonitoringOnly()
+    {
+        // Fault sampling without the power search. The manual bench state needs the
+        // thermal and OVP thresholds evaluated and logged, but nothing may move the
+        // level out from under the operator.
+        LOG_INFO("WPT Manager: Fault monitoring only (power control timer not started)\n");
+        mFaultTimer.Start();
+    }
+
+#if WPT_MANUAL_DEBUG_MODE
+    void WptManager::EnterManualIdle()
+    {
+        // DisableWpt() posts the cold-start escalation timer's stop before it calls
+        // ResetPowerControl(). The timer task outranks this one, so an escalation
+        // that had already expired runs before the reset rather than after it,
+        // and the level still ends at COLD_START_LEVEL.
+        DisableWpt();
+        StartFaultMonitoringOnly();
+        LOG_WARNING("WPT Manager: Manual idle - coil off, level %d, fault monitoring only\n", m_level);
+    }
+#endif
 
     void WptManager::StopIpgTemperaturePgoodMonitoringTimer()
     {
@@ -356,6 +384,20 @@ namespace svc
         {
             if (ipg_temperature >= IPG_TEMP_THRESHOLD_PAUSE)
             {
+#if WPT_MANUAL_DEBUG_MODE
+                // Warn only: the threshold is still evaluated and reported, but the
+                // coil is left exactly where the operator put it. The IPG's own
+                // 42 C gate is unaffected and still applies.
+                if (DebugConsole::IsManual())
+                {
+                    LOG_WARNING("[MANUAL] WARN thermal: IPG %d.%02d C >= %d C pause threshold (ignored)\n",
+                                (int32_t)ipg_temperature,
+                                (int32_t)((ipg_temperature) * 100) % 100,
+                                IPG_TEMP_THRESHOLD_PAUSE);
+                    return;
+                }
+#endif
+
                 LOG_ERROR("WPT Manager: IPG temperature %d.%02d C reached pause threshold (%d C), pausing power transfer",
                           (int32_t)ipg_temperature,
                           (int32_t)((ipg_temperature) * 100) % 100,
@@ -437,6 +479,18 @@ namespace svc
                 m_ovp_ceiling = m_level;
             }
 
+#if WPT_MANUAL_DEBUG_MODE
+            // Warn only. The ceiling above is still recorded, so a later return to
+            // automatic mode still knows which level faulted, but nothing pauses
+            // the coil and nothing steps the level down.
+            if (DebugConsole::IsManual())
+            {
+                LOG_WARNING("[MANUAL] WARN ovp: asserted at level %d (vrect=%d chg2=%d), ceiling %d noted, ignored\n",
+                            m_level, vrect_ovp, chg2_ovp, m_ovp_ceiling);
+                return;
+            }
+#endif
+
             LOG_ERROR("WPT Manager: IPG OVP asserted at level %d (vrect=%d chg2=%d chg1=%d), ceiling now %d, pausing",
                       m_level, vrect_ovp, chg2_ovp, (p.GET_CHG1_OVP_ERR == 0), m_ovp_ceiling);
 
@@ -483,6 +537,28 @@ namespace svc
     {
         LOG_DEBUG("WPT Manager: SetPulseWidthThresholdStep\n");
         WptHalInstance.SetPulseWidthThresholdStep(step);
+    }
+
+    uint8_t WptManager::GetMaxPowerLevel()
+    {
+        return m_max_power_level;
+    }
+
+    void WptManager::SetPowerLevelManual(uint8_t level)
+    {
+        SetPowerLevel(level);
+    }
+
+    void WptManager::RearmPowerSearch()
+    {
+        m_floor_found = false;
+        m_pgood_low_count = 0;
+
+        // Skip a cycle so the first automatic decision is made on telemetry that
+        // reflects the level actually in force, not one sampled mid-handover.
+        m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+
+        LOG_INFO("WPT Manager: Power search re-armed at level %d\n", m_level);
     }
 
     void WptManager::ResetPowerControl()
@@ -668,6 +744,16 @@ namespace svc
         IpgOvpMonitoring();
 
         IpgTemperatureMonitoring();
+
+#if WPT_MANUAL_DEBUG_MODE
+        // Attribution: with every charger-side cutoff disabled, this is the only
+        // way to tell an IPG that has shut itself down from a command that never
+        // took effect.
+        if (DebugConsole::IsManual())
+        {
+            DebugConsole::LogIpgBits();
+        }
+#endif
 
         LOG_FLUSH();
     }

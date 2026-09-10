@@ -17,6 +17,7 @@
 #include "hal_wpt.h"
 #include "hal_dac.h"
 #include "eda_timer.h"
+#include "svc_debug_config.h"
 
 namespace svc
 {
@@ -49,7 +50,11 @@ namespace svc
         enum PauseReason_e : uint8_t
         {
             PAUSE_THERMAL = 1 << 0,
-            PAUSE_OVP = 1 << 1
+            PAUSE_OVP = 1 << 1,
+            /// Set only by the RTT debug console. Uses the same mask as the fault
+            /// reasons so a manual stop cannot be undone by an automatic resume,
+            /// and so the coil-enabled-iff-mask-is-zero rule keeps holding.
+            PAUSE_MANUAL = 1 << 2
         };
 
         /// Suspends coil output for a fault condition, without stopping fault or
@@ -91,6 +96,29 @@ namespace svc
         /// Starts the IPG temp and PGOOD status timer.
         void StartIpgTemperaturePgoodMonitoringTimer();
 
+        /// Starts fault monitoring (IPG temperature + OVP) WITHOUT the power
+        /// control timer.
+        ///
+        /// Used by the manual bench state: the fault monitor must run so the
+        /// thermal and OVP thresholds are still evaluated and reported, but the
+        /// titration loop must never move the operator's level. Not starting the
+        /// timer is what makes that structural rather than a runtime check.
+        /// StopIpgTemperaturePgoodMonitoringTimer() still stops both, so there is
+        /// no matching partial stop.
+        void StartFaultMonitoringOnly();
+
+#if WPT_MANUAL_DEBUG_MODE
+        /// Establishes manual mode's idle baseline: coil off, every WPT timer
+        /// stopped, any pending cold-start escalation cancelled, power search reset,
+        /// then fault monitoring restarted on its own.
+        ///
+        /// Must run on the WPT task, dispatched from WPT_MANUAL_IDLE. The SYSTEM task
+        /// outranks the WPT task, so anything the previous application state queued
+        /// here is processed after StateManual::Entry(); only an event queued behind
+        /// those can be relied on to have the last word.
+        void EnterManualIdle();
+#endif
+
         /// Stops the IPG temp and PGOOD status timer.
         void StopIpgTemperaturePgoodMonitoringTimer();
 
@@ -101,6 +129,52 @@ namespace svc
 
         /// Set Wpt power Transfer pulse width
         void AdjustWptPowerTransfer(uint8_t step);
+
+        /// Applies an absolute PTH step on behalf of the RTT debug console.
+        ///
+        /// Goes through the same path as the automatic loop so that m_level stays
+        /// the single source of truth for the current step - setting the DAC alone
+        /// would leave the recorded level stale and desynchronise the status dump
+        /// and any later automatic resume.
+        ///
+        /// @param level PTH step; clamped to the hardware maximum.
+        static void SetPowerLevelManual(uint8_t level);
+
+        /// Current PTH step.
+        static uint8_t GetPowerLevel() { return m_level; }
+
+        /// Highest PTH step the hardware accepts.
+        static uint8_t GetMaxPowerLevel();
+
+        /// Bitmask of PauseReason_e. Zero means the coil is enabled.
+        static uint8_t GetPauseReasons() { return m_pause_reasons; }
+
+        /// Lowest step observed to trip an IPG OVP fault, or LEVEL_INVALID.
+        static uint8_t GetOvpCeiling() { return m_ovp_ceiling; }
+
+        /// Highest step observed to be insufficient for PGOOD, or LEVEL_INVALID.
+        static uint8_t GetPgoodFloor() { return m_pgood_floor; }
+
+        /// True once the downward power search has settled.
+        static bool IsFloorFound() { return m_floor_found; }
+
+        /// True while the coil is actually being driven.
+        ///
+        /// Not the same as GetPauseReasons() == 0: with the WPT state machine in
+        /// StateIdle the mask is zero and the coil is off, which is exactly where
+        /// manual mode idles before 's' is pressed.
+        static bool IsCoilEnabled() { return m_coil_enabled; }
+
+        /// Re-opens the downward power search without discarding what has been
+        /// observed about the usable window.
+        ///
+        /// Needed when handing control back from the debug console: the level the
+        /// operator happened to stop on is not a floor the loop derived, but
+        /// m_floor_found may still be set from before. Leaving it set would make
+        /// the loop hold that level indefinitely instead of resuming its descent.
+        /// m_ovp_ceiling and m_pgood_floor are deliberately kept - those are real
+        /// observations of the hardware and stay valid.
+        static void RearmPowerSearch();
 
         int16_t mWptImonVoltage;
 
@@ -259,6 +333,10 @@ namespace svc
 
         // Bitmask of PauseReason_e. Coil output is enabled only while this is zero.
         static uint8_t m_pause_reasons;
+
+        // Tracks the actual coil drive state, which the pause mask alone cannot
+        // express - see IsCoilEnabled().
+        static bool m_coil_enabled;
 
         // Time held in each pause, counted in fault-monitor ticks.
         static uint16_t m_thermal_pause_ticks;

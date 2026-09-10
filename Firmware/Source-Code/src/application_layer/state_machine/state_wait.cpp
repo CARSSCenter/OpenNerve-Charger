@@ -13,6 +13,7 @@
 #include "app_state_machine.h"
 #include "hal_dfu.h"
 #include "hal_led.h"
+#include "svc_debug_config.h"
 
 
 namespace app
@@ -35,6 +36,11 @@ namespace app
         case SystemPort::Event_e::BUTTON_PRESSED:
             stateMachine->ChangeState(states->pStateScan);
             break;
+#if WPT_MANUAL_DEBUG_MODE
+        case SystemPort::Event_e::MANUAL_TAKEOVER:
+            stateMachine->ChangeState(states->pStateManual);
+            break;
+#endif
         case SystemPort::Event_e::BUTTON_DFU_PRESSED:
             if (!hal::Dfu::Instance().is_dfu_active())
             {

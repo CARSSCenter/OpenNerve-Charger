@@ -60,6 +60,15 @@ namespace svc
             stateMachine->ChangeState(states->pStateSlowCharge);
             break;
         }
+#if WPT_MANUAL_DEBUG_MODE
+        case WptPort::Event_e::WPT_MANUAL_IDLE:
+        {
+            // Already idle, but the previous application state may have left
+            // monitoring timers or a cold-start escalation running.
+            mWptManager.EnterManualIdle();
+            break;
+        }
+#endif
         default:
         {
             break;

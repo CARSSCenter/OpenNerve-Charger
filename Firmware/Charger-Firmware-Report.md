@@ -78,6 +78,7 @@ Values below are for `BOARD == PCBA`. `hal_pinout.h:65-111` defines a materially
 | White (slow charge) | Coil powering up a switched-off IPG — waiting for BLE |
 | Yellow (charging) | IPG found, WPT active, batteries charging |
 | Green (charged) | All batteries full |
+| Magenta (manual) | **Debug builds only** — `StateManual`, operator driving the coil over RTT (§4.7) |
 
 ---
 
@@ -91,12 +92,14 @@ Values below are for `BOARD == PCBA`. `hal_pinout.h:65-111` defines a materially
 │  app_state_machine.cpp / app_system.cpp     │
 │  state_wait / state_scan / state_charge /   │
 │  state_slow_charge_and_scan /               │
-│  state_initialization                       │
+│  state_initialization /                     │
+│  state_manual (debug builds only)           │
 ├─────────────────────────────────────────────┤
 │              Service Layer                  │
 │  BLE: svc_ble_manager / svc_ble_subsystem   │
 │  WPT: svc_wpt_manager / svc_wpt_subsystem   │
 │  PMC: svc_pmc_subsystem                     │
+│  Debug: svc_debug_console (debug builds)    │
 ├─────────────────────────────────────────────┤
 │               Core Layer                    │
 │  EDA framework: state machines, active      │
@@ -123,7 +126,8 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
 | `BATTERY_CHARGED` | All batteries full |
 | `BUTTON_PRESSED` | User pressed the power button |
 | `BUTTON_DFU_PRESSED` | DFU mode button combo |
-| `TURN_OFF` | **Vestigial.** Formerly the thermal shutdown path. Nothing in the codebase sends it any more — only the receiver at `state_charge.cpp:59` remains. Thermal faults no longer reach the application layer at all (see §6.5). |
+| `TURN_OFF` | Formerly the thermal shutdown path; thermal faults no longer reach the application layer at all (§6.5). In a **production** build nothing sends it and the handler at `state_charge.cpp:60` is unreachable. In a **debug** build the RTT console's `n` command sends it to leave `StateManual` (`state_manual.cpp:67`). |
+| `MANUAL_TAKEOVER` | **Debug builds only** (0x12). Sent by the RTT console's `m` command; each operational state transitions to `StateManual` on it (§4.7). Safe despite `MAX_EVENT_ENUM_LENGTH = 20`: `SystemPort::ExecuteEvent` dispatches straight to the state machine and never indexes `mEventCallback`. |
 
 **WPT service events** (`svc_wpt_port.h`):
 
@@ -136,11 +140,12 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
 | `WPT_BATTERY_CHARGED` | 0x0B | BLE confirms all batteries full |
 | `WPT_SLOW_CHARGE` | 0x0C | Begin the open-loop cold-start attempt (step 7, escalating to max) |
 | `WPT_SCAN_TIMEOUT` | 0x0D | Power search timed out |
-| `WPT_ADJUST_POWER` | 0x0E | Set specific DAC step |
-| `WPT_FAULT_PAUSE` | 0x0F | Suspend coil output for a fault; `optDataAddress` carries the `PauseReason_e` |
+| `WPT_ADJUST_POWER` | 0x0E | Set specific DAC step. Handled in `StateCharging` and `StateSlowCharge`; **dropped** in `StateIdle` (§6.1) |
+| `WPT_FAULT_PAUSE` | 0x0F | Suspend coil output; `optDataAddress` carries the `PauseReason_e` (`PAUSE_THERMAL`, `PAUSE_OVP`, or in debug builds `PAUSE_MANUAL`) |
 | `WPT_FAULT_RESUME` | 0x10 | Clear one pause reason; `optDataAddress` carries the `PauseReason_e` |
+| `WPT_MANUAL_IDLE` | 0x11 | **Debug builds only.** Sent by `StateManual::Entry()`; every WPT state stops the coil and settles in `StateIdle` with fault monitoring only (§4.7) |
 
-`WPT_FAULT_PAUSE`/`WPT_FAULT_RESUME` replaced the earlier `WPT_THERMAL_PAUSE`/`WPT_THERMAL_RESUME` pair at the same event values, generalized to carry a reason so thermal and OVP can share one pause mechanism (see §6.2).
+`WPT_FAULT_PAUSE`/`WPT_FAULT_RESUME` replaced the earlier `WPT_THERMAL_PAUSE`/`WPT_THERMAL_RESUME` pair at the same event values, generalized to carry a reason so thermal and OVP can share one pause mechanism (see §6.2). The debug console reuses the same pair with `PAUSE_MANUAL` for its coil stop/start. Manual mode adds exactly one WPT event, `WPT_MANUAL_IDLE` (0x11, debug builds only) — kept to one because callbacks registered on a port are stored in a 20-entry array indexed by event ID (`eda_port.h:13`).
 
 ---
 
@@ -181,9 +186,11 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
           │
           │ BATTERY_CHARGED → StateWait (green LED)
           │ BUTTON_PRESSED  → StateWait
-          │ TURN_OFF        → StateWait   (unreachable — nothing sends TURN_OFF)
+          │ TURN_OFF        → StateWait   (unreachable in production builds — see §3.2)
           │ WPT_SCAN_TIMEOUT → StateWait  (unreachable — see §11, GetStat() stub)
 ```
+
+**Debug builds add `StateManual` (§4.7).** `StateWait`, `StateScan`, `StateSlowChargeAndScan` and `StateCharge` each move to it on `MANUAL_TAKEOVER`; only `TURN_OFF` (the console's `n`) returns it to `StateWait` — Button 1 is ignored there. It is not drawn above because it does not exist in a production build.
 
 ### 4.2 StateInitialization
 
@@ -191,7 +198,7 @@ Entry sends `INITIALIZE` to the BLE, WPT, and PMC subsystem ports. When `BLE_INI
 
 ### 4.3 StateWait
 
-Idle state. No LEDs, no scanning, no WPT. Transitions to `StateScan` on `BUTTON_PRESSED`.
+Idle state. No LEDs, no scanning, no WPT. Transitions to `StateScan` on `BUTTON_PRESSED`, and in debug builds to `StateManual` on `MANUAL_TAKEOVER`. "No WPT" does not imply VCC_EN is low: arriving from `StateCharge` leaves the rail up, because `StateCharge::Exit()` never sends `PMC_POWER_OFF` (§4.6).
 
 ### 4.4 StateScan
 
@@ -211,6 +218,9 @@ DispatchEvent:
 
   BUTTON_DFU_PRESSED:
     hal::Dfu::start_dfu_mode()
+
+  MANUAL_TAKEOVER:                    (debug builds only)
+    → ChangeState(StateManual)
 
 Exit:
   WptPort::WPT_POWER_ON            ← transitions WPT SM StateIdle → StateCharging
@@ -251,6 +261,9 @@ DispatchEvent:
   BUTTON_DFU_PRESSED:
     hal::Dfu::start_dfu_mode()
 
+  MANUAL_TAKEOVER:                    (debug builds only)
+    → ChangeState(StateManual)
+
 Exit:
   BleManager::SetScanTimeout(10000)     ← restore default (same value since the change below)
   hal::Leds::LedChargingSlow(false)
@@ -284,7 +297,7 @@ DispatchEvent:
     → ChangeState(StateWait)
 
   TURN_OFF:
-    → ChangeState(StateWait)            ← UNREACHABLE: nothing sends TURN_OFF any more
+    → ChangeState(StateWait)            ← unreachable in production builds (§3.2)
 
   BLE_SCAN_TIMEOUT:
     BlePort::START_SCANNING             ← restart scan, do NOT exit charge state
@@ -294,6 +307,9 @@ DispatchEvent:
 
   BUTTON_DFU_PRESSED:
     hal::Dfu::start_dfu_mode()
+
+  MANUAL_TAKEOVER:                    (debug builds only)
+    → ChangeState(StateManual)
 
 Exit:
   BlePort::STOP_SCANNING
@@ -306,6 +322,67 @@ Exit:
 That reduced advertising rate has a second consequence the control loop has to handle directly: `GetAdvertisementData()` returns the last parsed advertisement indefinitely, so a PGOOD sample can be seconds old and predate the power step being evaluated. See §5.2 and §6.3 for the freshness guard that addresses it.
 
 **Thermal and OVP faults do not exit this state.** Both are handled entirely inside the WPT service layer by pausing coil output while leaving the state machines in place (§6.2). The application layer stays in `StateCharge`, the yellow LED stays on, and recovery needs no button press.
+
+**`Exit()` does not drop VCC_EN.** No `PMC_POWER_OFF` is sent, so leaving `StateCharge` on `BATTERY_CHARGED` or `BUTTON_PRESSED` parks PMC in `PmcStateEnable`: the LTC4125 stays powered, though disabled (`WPT_EN` high), in `StateWait`. Harmless for coil output, but worth knowing when probing VCC_EN — and the reason `StateManual::Exit()` sends `PMC_POWER_OFF` explicitly (§4.7).
+
+### 4.7 StateManual (debug builds only)
+
+Exists only when `WPT_MANUAL_DEBUG_MODE` is 1 (§10); a production build contains none of it. It lets an operator drive the coil by hand over RTT while normal logging continues. Background and rationale are in §8.4.
+
+```
+Entry:
+  DebugConsole::OnManualEntered()         ← the state owns the console's manual flag
+  PmcPort::PMC_POWER_ON                   ← VCC_EN high
+  BlePort::START_SCANNING                 ← IPG telemetry for the warn-only monitors
+  WptPort::WPT_MANUAL_IDLE                ← queued behind the previous state's WPT events:
+                                            coil off, timers stopped, escalation cancelled,
+                                            level → step 7, WPT SM → StateIdle, then
+                                            fault monitoring only
+  magenta LED
+
+DispatchEvent:
+  TURN_OFF:            → ChangeState(StateWait)   ← console 'n' — the only way out
+  BUTTON_PRESSED:      ignored, logged            ← Button 1 disabled in manual mode
+  BLE_SCAN_TIMEOUT:    BlePort::START_SCANNING    ← re-arm, no state change
+  BATTERY_CHARGED:     BlePort::START_SCANNING    ← undo ProcessNewBleData()'s STOP_SCANNING
+  BUTTON_DFU_PRESSED:  hal::Dfu::start_dfu_mode()
+  (WPT_SCAN_TIMEOUT and BLE_DEVICE_FOUND deliberately absent)
+
+Exit:
+  DebugConsole::OnManualExited()
+  mWptManager.StopIpgTemperaturePgoodMonitoringTimer()
+  WptPort::WPT_POWER_OFF
+  BlePort::STOP_SCANNING
+  PmcPort::PMC_POWER_OFF                  ← required; nothing else drops the rail
+  LEDs off
+```
+
+It is entered from `StateWait`, `StateScan`, `StateSlowChargeAndScan` or `StateCharge` on `MANUAL_TAKEOVER`, which the console sends on `m`. Behaviour that must not happen in manual mode is expressed as a missing case rather than a runtime check, which is why a scan timeout with no IPG present cannot end the session the way it does in `StateSlowChargeAndScan` (§8.4). Whatever the previous state was doing — scanning, a cold start, an automatic charge — is stopped on entry, and the board idles with the coil off until `s`. Button 2, which resets the MCU from its ISR, remains the physical escape hatch.
+
+Console commands (`svc_debug_console.cpp`, polled every 100 ms on the SEGGER RTT down-channel):
+
+| Key | Action |
+|---|---|
+| `m` / `n` | enter / leave manual mode |
+| `s` | coil start: `PMC_POWER_ON`, `WPT_POWER_ON`, `WPT_FAULT_RESUME(PAUSE_MANUAL)`, `WPT_ADJUST_POWER` — in that order, because WPT `StateIdle` drops the last two (§6.1) |
+| `x` | coil stop: `WPT_FAULT_PAUSE(PAUSE_MANUAL)`. VCC_EN stays up, so only `WPT_ENn` moves |
+| `+` / `-`, `0`–`9`, `a`–`c` | step, or set, PTH 0–12 via `SetPowerLevelManual()` |
+| `?` / `h` | status (mode, coil, pause mask, app state, level and mV, bounds, IPG bits, dead-man) / help |
+
+Thermal and OVP are warn-only (§6.5, §6.6), the raw IPG fault bits are logged every fault tick, and a dead-man timeout pauses the coil after 10 minutes with no keystroke.
+
+**Why entry goes through a WPT event (fixed 2026-09-10).** An earlier revision did the WPT setup directly in `Entry()` and failed for three of the four entry states, all for one reason. `ChangeState()` runs the previous state's `Exit()` and `StateManual::Entry()` back-to-back on the SYSTEM task, which runs at priority `app` (4) against the WPT task's `svc_1` (1), so whatever the previous `Exit()` queued to the WPT port is processed *after* `Entry()`:
+
+| Entered from | Queued by the previous `Exit()` | Effect of direct setup in `Entry()` |
+|---|---|---|
+| `StateWait` | nothing | worked |
+| `StateScan` | `WPT_POWER_ON` | coil came on once VCC_EN rose |
+| `StateSlowChargeAndScan` | nothing — coil already on | coil stayed on; a pending cold-start escalation could take it to step 12 |
+| `StateCharge` | `WPT_POWER_OFF` | its `DisableWpt()` stopped the fault timer `Entry()` had just started |
+
+`WPT_MANUAL_IDLE` is queued behind those events on the same port, so FIFO order makes it the last word; its handler is `WptManager::EnterManualIdle()`. A cold-start escalation expiring at the same moment cannot leave the level at step 12: `DisableWpt()` posts the timer's stop before `ResetPowerControl()`, and the FreeRTOS timer task (priority 2) preempts the WPT task (1) on that post, so the escalation runs before the reset, not after. The one visible residue is entry from `StateScan`, whose queued `WPT_POWER_ON` still drives `WPT_ENn` low for well under a millisecond before `WPT_MANUAL_IDLE` is processed — normally with VCC_EN still off, since `StateScan` never raises it.
+
+The same revision let Button 1 leave manual mode without clearing the console's flag, which demoted thermal and OVP to warn-only in the next automatic session. Button 1 is now ignored in `StateManual`, and the flag is owned by the state itself (`OnManualEntered()`/`OnManualExited()`), so the two cannot disagree.
 
 ---
 
@@ -396,14 +473,19 @@ StateIdle
   │ WPT_POWER_ON → StateCharging
   │ WPT_SLOW_CHARGE → StateSlowCharge
   │ INITIALIZE: mWptManager.Init()
+  │ WPT_MANUAL_IDLE: mWptManager.EnterManualIdle()          (debug builds)
+  │ everything else is silently dropped — including WPT_ADJUST_POWER,
+  │ WPT_FAULT_PAUSE and WPT_FAULT_RESUME
 
 StateSlowCharge
   │ Entry: mWptManager.EnableWpt()
   │ WPT_POWER_ON / WPT_LOAD_DETECTED → StateCharging
   │ WPT_POWER_OFF → StateIdle (calls mWptManager.DisableWpt())
   │ WPT_SCAN_TIMEOUT → StateIdle
+  │ WPT_ADJUST_POWER: mWptManager.AdjustWptPowerTransfer(step)   ← added 2026-09-09
   │ WPT_FAULT_PAUSE:  mWptManager.PauseWpt(reason)   — no state change
   │ WPT_FAULT_RESUME: mWptManager.ResumeWpt(reason)  — no state change
+  │ WPT_MANUAL_IDLE: EnterManualIdle() → StateIdle          (debug builds)
 
 StateCharging
   │ Entry: mWptManager.EnableWpt()
@@ -416,11 +498,16 @@ StateCharging
   │ WPT_FAULT_CONDITION: → WPT_POWER_OFF
   │ WPT_FAULT_PAUSE:  mWptManager.PauseWpt(reason)   — no state change
   │ WPT_FAULT_RESUME: mWptManager.ResumeWpt(reason)  — no state change
+  │ WPT_MANUAL_IDLE: EnterManualIdle() → StateIdle          (debug builds)
 
 StateTest (stub — Entry and DispatchEvent log only, no behavior)
 ```
 
 **Why the fault cases change no state:** a thermal or OVP pause must stop coil output without tearing down monitoring, because the recovery condition can only be observed by continuing to sample. Staying in `StateCharging` also keeps the application layer in `StateCharge`, so recovery is automatic rather than requiring a button press. Both WPT states carry the cases because the monitoring timers also run while scanning and slow-charging, so a fault can arrive in `StateSlowCharge` and not only in `StateCharging`.
+
+**`StateIdle` drops more than it appears to.** Its `default:` case (`svc_wpt_state_idle.cpp:72`) silently discards every event except `INITIALIZE`, `WPT_POWER_ON`, `WPT_SLOW_CHARGE` and, in debug builds, `WPT_MANUAL_IDLE`. A power adjustment, pause or resume that arrives while the WPT SM is idle is lost, not deferred. Any sequence that must land in `StateCharging` therefore has to send `WPT_POWER_ON` first — which is why the ordering of the debug console's coil-start command is load-bearing (§4.7).
+
+**`StateSlowCharge` used to drop `WPT_ADJUST_POWER` as well.** Every power step arriving there was discarded and the DAC kept its previous value. The state is currently unreachable (§11), so this never bit in practice, but it would have the moment it became reachable. Fixed on 2026-09-09, independently of the debug work.
 
 ### 6.2 WPT Manager
 
@@ -446,11 +533,23 @@ Step 5 is what makes a charge session start clean. An earlier revision left the 
 Thermal and OVP faults share one pause mechanism, arbitrated by a bitmask:
 
 ```cpp
-enum PauseReason_e : uint8_t { PAUSE_THERMAL = 1 << 0, PAUSE_OVP = 1 << 1 };
+enum PauseReason_e : uint8_t {
+    PAUSE_THERMAL = 1 << 0,
+    PAUSE_OVP     = 1 << 1,
+    PAUSE_MANUAL  = 1 << 2,   // debug console only — see §4.7
+};
 static uint8_t m_pause_reasons;   // coil enabled iff == 0
 ```
 
 `PauseWpt()` disables the coil only on the first reason set; `ResumeWpt()` re-enables it only once the mask returns to zero. With two independent booleans instead, overlapping faults would resume each other — whichever cleared first would restore power while the other was still asserted. Neither function touches the monitoring timers.
+
+`PAUSE_MANUAL` is set and cleared only by the RTT debug console. Putting it in the same mask means a manual stop cannot be undone by an automatic fault resume, and the "coil enabled iff mask == 0" rule keeps holding without a special case.
+
+**Coil state tracking — `m_coil_enabled` / `IsCoilEnabled()`.** The mask alone cannot say whether the coil is being driven: in WPT `StateIdle` the mask is zero *and* the coil is off. `m_coil_enabled` records the actual drive state. It is set wherever `WptHalInstance.Enable()` really runs — `EnableWpt()` on its unmasked branch, and `ResumeWpt()` when the mask reaches zero — and cleared in `DisableWpt()` and on the first `PauseWpt()`.
+
+**Monitoring timer entry points.** `StartIpgTemperaturePgoodMonitoringTimer()` starts both the fault timer and the power-control timer (§6.3). `StartFaultMonitoringOnly()` starts only the fault timer; manual mode uses it so thresholds are still evaluated while the titration loop never runs. In debug builds `EnterManualIdle()` combines what manual mode needs on entry — `DisableWpt()` then `StartFaultMonitoringOnly()` — and runs on the WPT task via `WPT_MANUAL_IDLE` (§4.7). There is a single stop, `StopIpgTemperaturePgoodMonitoringTimer()`, which stops both.
+
+**Accessors for the debug console.** `SetPowerLevelManual()` routes through `SetPowerLevel()`, so `m_level` stays the single source of truth. Alongside it: `GetPowerLevel()`, `GetMaxPowerLevel()`, `GetPauseReasons()`, `GetOvpCeiling()`, `GetPgoodFloor()`, `IsFloorFound()`, and `IsCoilEnabled()` — the last read only by the console's status dump. `RearmPowerSearch()` clears `m_floor_found` while keeping the observed bounds; it currently has **no callers**. It was written for an exit-to-automatic handover that was replaced by a full shutdown on exit, and is kept in case that handover is wanted.
 
 **`AdjustWptPowerTransfer(step)`:**
 Calls `SetPulseWidthThresholdStep(step)`, which writes:
@@ -478,7 +577,7 @@ The single 2-second timer that formerly drove both temperature and PGOOD has bee
 
 Faults need the fast rate: the IPG holds itself in its own PAUSED state for only 5 s after a VRECT OVP event before re-enabling, so the charger has to see and react inside that window. Power steps need the slow rate: a PTH change must settle *and* propagate back through an IPG BLE advertisement before it can be evaluated, and at 2 s the loop was frequently deciding on telemetry that predated its own last change.
 
-Both are started and stopped together by `StartIpgTemperaturePgoodMonitoringTimer()` / `StopIpgTemperaturePgoodMonitoringTimer()`, so callers treat them as one unit.
+Every automatic path starts and stops them together through `StartIpgTemperaturePgoodMonitoringTimer()` / `StopIpgTemperaturePgoodMonitoringTimer()`. They can also be separated: `StartFaultMonitoringOnly()` starts the fault timer alone, and debug-build manual mode (§4.7) uses it. That is what makes "manual mode never titrates" structural rather than a runtime check — the power-control timer is simply never started. The single stop function still stops both.
 
 #### The control law
 
@@ -571,6 +670,8 @@ The dwell is counted in fault-timer ticks (`THERMAL_PAUSE_MIN_TICKS = 15` × 2 s
 
 *Resume does not reset the power level.* An earlier revision called `ResetPgoodMonitoringStateMachine()` on thermal resume. Under the current design that would jump the level back to its starting point on every recovery, producing 30-second power bursts at the thermal limit. Instead the level is preserved and `m_floor_found` is cleared, re-arming the downward search (§6.3) — the trip is treated as evidence to search lower, not as a reason to start over.
 
+**In debug-build manual mode (§4.7)** the temperature is still computed and logged every 2 s. Crossing 41 °C logs `[MANUAL] WARN thermal: … (ignored)` but sends no `WPT_FAULT_PAUSE`. The IPG's own thermal gate at 42 °C is independent of the charger and still applies.
+
 ### 6.6 OVP Handling — and why PGOOD alone is ambiguous
 
 This is the single most important interaction between the two firmwares, and the charger did not participate in it at all before 2026-09-03.
@@ -604,6 +705,8 @@ const bool ovp_active = (p.GET_VRECT_OVP == 0) || (p.GET_CHG2_OVP_ERR == 0);
 **Why the blanking cycle exists.** When the IPG re-enables, its VCHG rail needs a moment to recover, so for one or two samples PGOOD reads 0 while OVP has already cleared. That is precisely the "add power" condition, and acting on it would undo the back-off and re-trip the fault immediately. `BLANK_CYCLES_AFTER_FAULT` makes the power loop skip a cycle after any fault resume.
 
 **Timing note.** The charger's 10 s pause is longer than the IPG's own 5 s hold, so the IPG re-enables first. This is safe: the charger's coil is off throughout its pause, VRECT is at zero, and OVP is therefore guaranteed clear by the time the charger resumes one step lower. It is more conservative than the handshake strictly requires — the IPG's stated expectation is a *power reduction*, not a coil shutdown — at the cost of ~10 s of charging per trip.
+
+**In debug-build manual mode (§4.7)** OVP is still detected and `m_ovp_ceiling` is still recorded, but the charger neither pauses nor steps down; it logs `[MANUAL] WARN ovp: … ignored` instead. The IPG's own response is unaffected — it still sets `VCHG_DISABLE`, so PGOOD still drops. That is why manual mode prints the raw IPG fault bits on every fault tick: it is the only way to tell an IPG protecting itself from a command that did not take effect.
 
 ---
 
@@ -656,7 +759,7 @@ The LTC4065 charger ICs in the IPG handle their own charge termination (C/10 cut
 
 Charging paused at 41 °C but never resumed. Every overtemp trip sent `WPT_POWER_OFF` → `DisableWpt()`, which stopped the monitoring timer that drives `IpgTemperatureMonitoring()` — so temperature was never re-sampled and the resume branch was unreachable. The 41 °C path also sent `SystemPort::TURN_OFF`, dropping the application state machine to `StateWait`, which recovers only by button press.
 
-Fixed by decoupling "stop delivering power" from "stop monitoring": dedicated pause/resume events that toggle only the coil driver, handled without any state transition. Thresholds were simplified from three tiers (41/39/36) to a single hysteresis band (41/39). Superseded in structure by §8.3, but the decoupling principle carries forward unchanged.
+Fixed by decoupling "stop delivering power" from "stop monitoring": dedicated pause/resume events that toggle only the coil driver, handled without any state transition. Thresholds were simplified from three tiers (41/39/36) to a single hysteresis band (41/39). Superseded in structure by §8.3, but the decoupling principle carries forward unchanged. The commit (`0ed080a`) also checked in a build artifact, `Firmware/hornet-wpt-charger_Debug_260804.hex`.
 
 ### 8.3 — 2026-09-03 bidirectional OVP-aware power control
 
@@ -679,6 +782,107 @@ Addresses two field failures: a powered-off IPG never waking at minimum coil pow
 | `IPG_TEMP_THRESHOLD_HIGH/MEDIUM/LOW` | 41 / 39 / 36 °C | *(removed)* | Replaced by a single pause/resume band |
 | `IPG_TEMP_THRESHOLD_PAUSE` / `_RESUME` | (new) | 41 / 39 °C | Single hysteresis band |
 | `STABILITY_THRESHOLD`, `MAX_FINE_TUNE_STEPS`, `MAX_COUNT_TOGGLING` | 10 / 2 / 3 | *(removed)* | Sized for the deleted state machine and the 2 s cadence |
+
+Two logging-only commits also landed on this branch. `2eb194b` (before the above) made `IpgTemperatureMonitoring()` log the IPG temperature to two decimal places and added a raw `GET_THERM_REF/OUT/OFST` line. `68d90a0` (after it) renamed the resistance log line in `CalculateTemperatureFromBle()` from "IPG thermal resistance" to "IPG thermistor resistance". Neither changes behaviour.
+
+### 8.4 — 2026-09-09 manual/debug control mode over RTT
+
+Adds a bench-test mode so the control loop of §8.3 can be validated against a hand-driven
+ground truth. Off by default and absent from a production binary: everything is gated on
+`WPT_MANUAL_DEBUG_MODE` in `src/service_layer/debug/svc_debug_config.h`, and a debug build
+still boots and runs the normal automatic loop until the operator presses `m` over RTT.
+
+Manual mode is an **application-layer state**, `StateManual`, not a flag that carves
+exceptions out of the automatic states. The first cut was flag-based and failed on
+hardware in three ways, all traceable to that choice:
+
+1. It never raised VCC_EN, so the console drove `PIN_WPT_EN` into an unpowered LTC4125.
+   The 5 V rail is owned solely by the PMC state machine (`PmcStateEnable::Entry/Exit`),
+   and only `StateCharge::Entry()` and `StateSlowChargeAndScan::Entry()` ever request it.
+2. `DebugConsole::StartCoil()` sent `WPT_FAULT_RESUME` before `WPT_POWER_ON`, but WPT
+   `StateIdle` drops the former, so a set `PAUSE_MANUAL` could never be cleared.
+3. It gated `StateCharge` but not `StateSlowChargeAndScan`, whose `BLE_SCAN_TIMEOUT`
+   handler is the only one in the codebase that sends `WPT_POWER_OFF` **and**
+   `PMC_POWER_OFF` **and** `ChangeState(pStateWait)` — killing power ~10 s in.
+
+The third is the instructive one: the bug was a *missing exception*, which is the failure
+mode a flag-based design invites and a state-based one cannot have. Behaviour that must
+not happen in manual mode is now expressed as the absence of a case in
+`StateManual::DispatchEvent`, and behaviour that must happen is `Entry()`/`Exit()`.
+
+Seven conditional gates collapsed to two:
+
+| Original gate | Now |
+|---|---|
+| `StateCharge` `BATTERY_CHARGED` | never a transition in `StateManual` — handled only to re-arm scanning |
+| `StateCharge` `WPT_SCAN_TIMEOUT` | no such case |
+| `StateSlowChargeAndScan` power-off (the missed one) | not in that state |
+| `PowerControlMonitoring` | `mPowerCtrlTimer` is never started |
+| `StartColdStartEscalation` / `ColdStartEscalate` | never started in manual mode; one left pending by the previous state is cancelled on entry (`EnterManualIdle()`) |
+| `IpgTemperatureMonitoring` warn-only | **kept** — the monitor must run and report |
+| `IpgOvpMonitoring` warn-only | **kept** — same |
+
+The two survivors are genuinely conditional: manual mode changes whether those monitors
+*act*, not whether they *run*.
+
+**This does not make the system unprotected.** The IPG runs its own thermal gate at 42 °C
+and its own OVP shutdown, neither of which the charger can disable (§6.6). That is why
+manual mode prints the IPG's raw fault bits on every 2 s fault tick — without that line,
+an IPG protecting itself is indistinguishable from a command that never took effect. A
+dead-man timeout pauses the coil after 10 minutes with no keystroke, covering the one risk
+the IPG's own gate does not: a bench rig with no IPG present.
+
+| File | Summary of changes |
+|------|-------------------|
+| `src/service_layer/debug/svc_debug_config.h` | New. `WPT_MANUAL_DEBUG_MODE` (default 0), poll period, dead-man timeout |
+| `src/service_layer/debug/svc_debug_console.{h,cpp}` | New. 100 ms RTT poll timer, single-keystroke handling, status dump, dead-man timer, `IsManual()`; `OnManualEntered()`/`OnManualExited()` so `StateManual` owns the manual flag |
+| `src/application_layer/state_machine/state_manual.{h,cpp}` | New. `Entry()` raises VCC_EN, starts scanning and sends `WPT_MANUAL_IDLE`; ignores Button 1; re-arms scanning after `BATTERY_CHARGED`; `Exit()` stops the coil, scanning and the rail |
+| `src/application_layer/app_port.h` | `MANUAL_TAKEOVER = 0x12`. `SystemPort::ExecuteEvent` dispatches straight to the state machine and never indexes `mEventCallback`, so `MAX_EVENT_ENUM_LENGTH` does not constrain it as it does on the BLE and WPT ports |
+| `src/application_layer/state_machine/app_state_machine.{h,cpp}` | `StateManual` registered in `StatePointers` and the constructor |
+| `state_wait.cpp`, `state_scan.cpp`, `state_slow_charge_and_scan.cpp`, `state_charge.cpp` | One `MANUAL_TAKEOVER` case each → `ChangeState(pStateManual)` |
+| `src/service_layer/wpt/svc_wpt_manager.{h,cpp}` | `PAUSE_MANUAL` in `PauseReason_e`; `StartFaultMonitoringOnly()`; `EnterManualIdle()`; `m_coil_enabled` + `IsCoilEnabled()`; `RearmPowerSearch()` (currently unused, §6.2); warn-only thermal/OVP paths; IPG-bit logging in `FaultMonitoring()`; accessors for the status dump |
+| `src/service_layer/wpt/svc_wpt_port.h` | `WPT_MANUAL_IDLE = 0x11` (debug builds) |
+| `svc_wpt_state_idle.cpp`, `svc_wpt_state_charging.cpp`, `svc_wpt_state_slow_charge.cpp` | `WPT_MANUAL_IDLE` case → `EnterManualIdle()`; the two active states also → `StateIdle` (debug builds) |
+| `src/service_layer/wpt/state_machine/svc_wpt_state_slow_charge.cpp` | **Bug fix, independent of debug mode:** added the missing `WPT_ADJUST_POWER` case. Power adjustments arriving in this state were previously discarded and the DAC kept its prior value |
+| `src/hal_layer/hal_wpt.h` | `StepToMillivolts()` so a PTH step can be reported in volts without duplicating the range constants |
+| `src/project/project/hornet-wpt-charger.emProject` | New `debug` folder, include directory, and `state_manual.cpp` |
+
+Design notes worth preserving:
+
+- **One new WPT port event, deliberately.** `MAX_EVENT_ENUM_LENGTH` is 20 and `WptPort::Event_e`
+  already reached `0x10`. PTH changes reuse `WPT_ADJUST_POWER`; coil stop/start reuses
+  `WPT_FAULT_PAUSE`/`WPT_FAULT_RESUME` with `PAUSE_MANUAL`. The one addition,
+  `WPT_MANUAL_IDLE` (0x11), exists because entry has to be ordered after the previous
+  state's queued WPT events (§4.7).
+- **`StateManual::Entry()` drives the WPT side to `StateIdle` rather than inheriting it.**
+  The coil is off because of where that state machine is, not because of a pause bit
+  something else might clear. `s` is what moves it to `StateCharging`.
+- **Command ordering in `StartCoil()` is load-bearing**: `WPT_POWER_ON` →
+  `WPT_FAULT_RESUME` → `WPT_ADJUST_POWER`. The latter two are dropped by `StateIdle`.
+- **A manual stop is a pause, not `WPT_POWER_OFF`.** Power-off transitions to `StateIdle`
+  and calls `DisableWpt()` → `ResetPowerControl()`, discarding the state being observed.
+  `x` therefore leaves VCC_EN up, so only `WPT_ENn` moves between stop and start.
+- **`StateManual::Exit()` must send `PMC_POWER_OFF` itself** — `StateCharge::Exit()` does
+  not, which is why leaving `StateCharge` normally parks VCC_EN high.
+- **`IsCoilEnabled()` is not `GetPauseReasons() == 0`.** In `StateIdle` the mask is zero and
+  the coil is off, which is exactly where manual mode idles before `s`.
+
+| Key | Action | Key | Action |
+|-----|--------|-----|--------|
+| `m` / `n` | enter / exit manual mode | `s` / `x` | coil start / stop |
+| `+` / `-` | step PTH up / down | `0`-`9`, `a`, `b`, `c` | set PTH step 0-12 |
+| `?` | status dump | `h` | help |
+
+Single keystrokes were chosen so commands fit the existing 16-byte RTT down-buffer; no
+`sdk_config.h` change is required.
+
+**Latent trap, not currently live:** `EnableWpt()` starts `mStatusTimeoutTimer` (5 s), whose
+callback sends `WPT_SCAN_TIMEOUT` if `GetStat() == 1`, and `StateCharging` answers that with
+`WPT_POWER_OFF`. In manual mode that would be a silent kill. It cannot fire today because
+`Wpt_LTC4125::GetStat()` is stubbed to `return 0` (§11). If HSD-285 is ever resolved and
+`GetStat()` implemented, this path must be revisited.
+
+**Status (2026-09-10).** Documenting the `StateManual` design turned up four defects by inspection: three entry paths that did not meet the "coil off, monitoring on" contract, and a stale console flag after leaving with Button 1. The same day, manual mode was changed to override every operational state explicitly — stopping any charge in progress and idling until `s` — with entry routed through `WPT_MANUAL_IDLE`, Button 1 disabled, and the flag owned by the state (§4.7). Both flag states compile clean across all 53 first-party sources. Not yet run on hardware; the only hardware run so far was the flag-based first cut described above.
 
 ---
 
@@ -761,6 +965,65 @@ First 10 s control cycle with telemetry
 ... charging proceeds as normal ...
 ```
 
+### 9.3 Manual bench control (debug builds only)
+
+```
+Debug build, board in any operational state (idle, scanning, slow charge, charging)
+
+Operator presses 'm' over RTT
+  → DebugConsole::EnterManual(): request only
+  → SystemPort::MANUAL_TAKEOVER
+  → App SM: <any operational state> → StateManual
+      (the previous state's Exit() runs first and may queue WPT events)
+  → StateManual::Entry():
+      DebugConsole::OnManualEntered() ← m_manual = true
+      PmcPort::PMC_POWER_ON          ← VCC_EN high; LTC4125 powered
+      BlePort::START_SCANNING        ← telemetry for the warn-only monitors
+      WptPort::WPT_MANUAL_IDLE       ← processed after the previous state's WPT events
+      magenta LED
+  → WPT task, EnterManualIdle():
+      DisableWpt()                   ← coil off, timers stopped, escalation cancelled,
+                                       level → step 7
+      StartFaultMonitoringOnly()     ← fault timer only; no titration, no cold start
+      WPT SM → StateIdle             ← coil off until 's'
+
+Operator presses 's'
+  → PmcPort::PMC_POWER_ON            (no-op — already in PmcStateEnable)
+  → WptPort::WPT_POWER_ON            ← WPT SM: StateIdle → StateCharging → EnableWpt()
+  → WptPort::WPT_FAULT_RESUME(PAUSE_MANUAL)
+  → WptPort::WPT_ADJUST_POWER(level)
+    (order matters: StateIdle would drop the last two)
+
+'+' / '-' / '0'…'9', 'a', 'b', 'c'
+  → WptManager::SetPowerLevelManual() → WPT_ADJUST_POWER → DAC CH1
+
+'x'
+  → WPT_FAULT_PAUSE(PAUSE_MANUAL)    ← coil off; VCC_EN stays up; stays in StateCharging
+
+Every 2 s (mFaultTimer)
+  → thermal / OVP thresholds evaluated, logged as [MANUAL] WARN, never acted on
+  → [MANUAL] IPG bits: … printed every tick
+
+Every 10 s with no IPG (BLE_SCAN_TIMEOUT)
+  → StateManual re-sends START_SCANNING — no state change, power unaffected
+
+10 min with no keystroke (dead-man)
+  → WPT_FAULT_PAUSE(PAUSE_MANUAL) — coil off until the operator presses 's'
+
+Button 1
+  → ignored in StateManual (logged); Button 2 still resets the MCU
+
+IPG reports battery charged (ProcessNewBleData() sends STOP_SCANNING)
+  → StateManual re-sends START_SCANNING on BATTERY_CHARGED
+
+Operator presses 'n'
+  → DebugConsole::ExitManual(): request only
+  → SystemPort::TURN_OFF
+  → App SM: StateManual → StateWait   (always StateWait, never the previous state)
+  → StateManual::Exit(): OnManualExited() (m_manual = false), stop monitoring
+                         timers, WPT_POWER_OFF, STOP_SCANNING, PMC_POWER_OFF, LED off
+```
+
 ---
 
 ## 10. Constants Reference
@@ -808,6 +1071,13 @@ NTC_R0                            = 5000     // Ω — local NTC at 25°C
 NTC_BETA                          = 3480
 ```
 
+**`svc_debug_config.h`** (debug console — see §4.7):
+```cpp
+WPT_MANUAL_DEBUG_MODE      = 0         // 1 = compile the console and StateManual in
+WPT_MANUAL_POLL_PERIOD_MS  = 100       // ms — RTT keystroke poll
+WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idle; 0 disables
+```
+
 ---
 
 ## 11. Known Limitations and Future Considerations
@@ -816,9 +1086,9 @@ NTC_BETA                          = 3480
 
 - **CTD control path is asserted but never used:** See §2.1. `WPT_CTD_CTRL` (P0.05) is driven HIGH at initialization and never changed, holding LTC4125 `CTD` at GND for the whole session. `StopSearch()` and `ResumeSearch()`, the functions meant to control it, are empty stubs — so `StopWptScan()` (reached via `WPT_STOP_SCAN`) does nothing. Needs a datasheet check and a scope on pin 14 to determine whether the current static state is correct.
 
-- **The WPT status path is inert:** `Wpt_LTC4125::GetStat()` unconditionally returns 0 (`hal_wpt.cpp:206-213`, TODO HSD-285 tracks the IC response investigation). Consequently `StatusTimeoutMonitoring` can never fire `WPT_SCAN_TIMEOUT`, the `WPT_SCAN_TIMEOUT → StateWait` transitions documented in §4.5 and §4.6 are unreachable, and the 500 ms `mStatusTimer` produces log output only. The WPT-side timeout safety net does not currently exist.
+- **The WPT status path is inert:** `Wpt_LTC4125::GetStat()` unconditionally returns 0 (`hal_wpt.cpp:206-213`, TODO HSD-285 tracks the IC response investigation). Consequently `StatusTimeoutMonitoring` can never fire `WPT_SCAN_TIMEOUT`, the `WPT_SCAN_TIMEOUT → StateWait` transitions documented in §4.5 and §4.6 are unreachable, and the 500 ms `mStatusTimer` produces log output only. The WPT-side timeout safety net does not currently exist. If it is ever made live it becomes a silent coil kill in debug-build manual mode — `EnableWpt()` arms the 5 s timer and `StateCharging` answers `WPT_SCAN_TIMEOUT` with `WPT_POWER_OFF` — so revisit that path if HSD-285 is resolved.
 
-- **`TURN_OFF` is vestigial:** Nothing sends it; only the receiver in `state_charge.cpp` remains. Safe to delete along with its handler.
+- **`TURN_OFF` is unsent in production builds:** Nothing outside the debug console sends it, so the `state_charge.cpp:60` handler is unreachable in a production build. It is no longer safe to delete — debug builds use it to leave `StateManual` (§4.7).
 
 - **Partial fault recovery:** Thermal and OVP faults now recover automatically (§6.5, §6.6). `WPT_FAULT_CONDITION` does not — it still sends `WPT_POWER_OFF` and falls to `StateIdle` with no retry and no user notification. A future enhancement could flash the LED or attempt a power cycle.
 
@@ -830,3 +1100,9 @@ NTC_BETA                          = 3480
   So there is currently **no charger-side thermal limit of any kind**, and the value in the logs is a constant. Since the coil sits against the patient's skin during charging, a touch-temperature limit is normally a requirement rather than an enhancement (IEC 60601-1 §11.1) — and fixing the conversion is a prerequisite for implementing one. Two hardware facts also need confirming before trusting a corrected value: whether the NTC is the high- or low-side element in the divider (`hal_wpt.cpp:189` assumes low-side), and whether `VCC_mV = 5000` (`hal_adc.h:23`) matches what the SAADC actually sees, since the nRF52840 cannot take 5 V directly and there is presumably a divider ahead of AIN6.
 
 - **Cold start is open-loop:** Between 5 s and 10 s of the cold-start window the charger drives maximum PTH with no PGOOD or OVP telemetry to steer by. A drained IPG loads VRECT down hard, so OVP is unlikely — but this is the one window in which a fault could not be detected. Worth watching on a bench unit with VRECT instrumented.
+
+- **VCC_EN stays high after leaving `StateCharge`:** `StateCharge::Exit()` sends no `PMC_POWER_OFF` (§4.6), so after a completed charge or a button press the LTC4125 remains powered, though disabled, in `StateWait`.
+
+- **Stale comment on the slow-charge scan window:** `state_slow_charge_and_scan.cpp:29` still says the state uses "a longer scan timeout so the IPG has time to power up". `SCAN_TIMEOUT_SLOW_CHARGE_MS` has equalled `SCAN_TIMEOUT_MS` (10 s) since §8.3 deliberately shortened it.
+
+- **`WptManager::RearmPowerSearch()` has no callers** (§6.2) — kept deliberately, but dead code today.
