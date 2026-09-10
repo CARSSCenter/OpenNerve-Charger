@@ -185,6 +185,12 @@ namespace svc
     private:
         static constexpr uint32_t k_resistor_value = 49900; // 49.9kΩ in ohms
 
+        // Largest value a wrapped THERM_OUT byte can decode to. The IPG packs OUT
+        // unclamped as (mV / 10) in one byte, so it wraps at 2560 mV, and its ADC
+        // cannot read above VREF+ <= 3.6 V (STM32 supply maximum):
+        // 3600 - 2560 = 1040 mV. See IsThermReadingPlausible().
+        static constexpr uint16_t THERM_OUT_WRAP_MAX_MV = 1040;
+
         // Temperature lookup table entry
         struct TempResistancePair
         {
@@ -296,6 +302,14 @@ namespace svc
         static float CalculateTemperatureFromBle(uint16_t get_therm_ref,
                                                  uint16_t get_therm_out,
                                                  uint16_t get_therm_ofst);
+
+        /// Rejects thermistor readings no real thermistor can produce - chiefly
+        /// the IPG's unclamped OUT byte wrapping to ~0 above 2.56 V ("n/a").
+        ///
+        /// @return true if the reading may be passed to CalculateTemperatureFromBle()
+        static bool IsThermReadingPlausible(uint16_t get_therm_ref,
+                                            uint16_t get_therm_out,
+                                            uint16_t get_therm_ofst);
 
         /// Evaluates the IPG temperature from BLE data and drives the thermal
         /// pause/resume hysteresis.

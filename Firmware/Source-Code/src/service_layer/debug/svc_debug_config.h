@@ -18,7 +18,7 @@
 /// 1 = bench/debug build. The console is compiled in, but the firmware still
 ///     boots and runs its normal automatic control loop until the operator
 ///     presses 'm' over RTT.
-#define WPT_MANUAL_DEBUG_MODE 0
+#define WPT_MANUAL_DEBUG_MODE 1
 
 /// How often the console checks the RTT down-channel for a keystroke.
 #define WPT_MANUAL_POLL_PERIOD_MS 100

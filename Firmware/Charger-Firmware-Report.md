@@ -657,6 +657,7 @@ This loop acts on the **IPG's** temperature, broadcast over BLE — not the char
 
 | Condition | Action |
 |-----------|--------|
+| Reading implausible (see below) | Log at WARNING with the raw values; **no decision** — not paused stays running, paused stays paused. The dwell keeps counting |
 | temp ≥ 41 °C (`IPG_TEMP_THRESHOLD_PAUSE`), not already paused | `WPT_FAULT_PAUSE(PAUSE_THERMAL)` — coil output stops, monitoring continues |
 | Paused, dwell < 30 s | Hold — no resume regardless of temperature |
 | Paused, dwell ≥ 30 s, temp > 39 °C (`IPG_TEMP_THRESHOLD_RESUME`) | Hold — keep waiting |
@@ -669,6 +670,19 @@ The dwell is counted in fault-timer ticks (`THERMAL_PAUSE_MIN_TICKS = 15` × 2 s
 *No application-layer involvement.* The old three-tier scheme (41 °C → `TURN_OFF`, 39 °C → `WPT_POWER_OFF`, 36 °C → `WPT_POWER_ON`) sent the charger out of `StateCharge` entirely on the top tier, into a state whose only exit is a physical button press. Worse, `WPT_POWER_OFF` routed through `DisableWpt()`, which stopped the very timer that drives this function — so once paused, temperature was never re-sampled and the resume branch was unreachable dead code. Thermal faults now stay inside the WPT service layer and never touch the application state machine.
 
 *Resume does not reset the power level.* An earlier revision called `ResetPgoodMonitoringStateMachine()` on thermal resume. Under the current design that would jump the level back to its starting point on every recovery, producing 30-second power bursts at the thermal limit. Instead the level is preserved and `m_floor_found` is cleared, re-arming the downward search (§6.3) — the trip is treated as evidence to search lower, not as a reason to start over.
+
+**Plausibility check (2026-09-10).** The IPG packs each thermistor voltage as `mV / 10` in one byte (IPG `app_mode_ble_active.c:137-139`). THERM_REF is clamped to 255 above 2550 mV; THERM_OUT and THERM_OFST are **not** clamped, so an OUT of 2560 mV or more wraps to 0–104 (0–1040 mV). BLE viewers display such a reading as "n/a". Fed to the calculation, a wrapped OUT gives `out − ofst < 0`, a negative resistance, the table's hot end — 50 °C — and a thermal pause from a single advertisement. `IsThermReadingPlausible()` rejects, before any temperature is computed:
+
+| Rejected when | Why |
+|---------------|-----|
+| any of ref / out / ofst = 0 | A wrapped byte, or the IPG's thermistor circuit unpowered |
+| out ≤ `THERM_OUT_WRAP_MAX_MV` (1040 mV) | A wrapped OUT. The IPG MCU (STM32U585) cannot read above VREF+ ≤ 3.6 V, so a wrapped OUT always decodes to at most 3600 − 2560 = 1040 mV. This bound holds whatever OFST is. A genuine OUT this low would need the thermistor below ~10 kΩ (~85–90 °C at the design OFST of ~0.8 V), unreachable without an earlier reading tripping at 41 °C |
+| out ≤ ofst | No voltage across the thermistor |
+| out ≥ ref | No current through the 49.9 kΩ sense resistor. Also catches OUT at 2550–2559 mV, which encodes as 255 — the same byte as the clamped REF |
+
+Because every wrap is caught by construction, no debounce is needed: a single *plausible* reading at or above 41 °C still pauses immediately.
+
+**Limitation — the charger reads low while REF is clamped.** On the board where this was diagnosed THERM_REF reads exactly 2550 in every advertisement, and a wrapped OUT (≥ 2560 mV) proves the real REF is higher. The charger therefore underestimates the sense-resistor drop, overestimates the resistance (≈ 1.2 MΩ) and reads **cold** — the "20.00 C" in normal logs is the table's cold-end clamp, not a measurement. An accepted reading is a lower bound on the true temperature: a ≥ 41 °C reading is always genuine, but a real overtemperature may go unseen. The IPG's own 42 °C gate uses the full 16-bit mV values and is unaffected; it is the effective thermal limit until the IPG encoding is fixed (§11).
 
 **In debug-build manual mode (§4.7)** the temperature is still computed and logged every 2 s. Crossing 41 °C logs `[MANUAL] WARN thermal: … (ignored)` but sends no `WPT_FAULT_PAUSE`. The IPG's own thermal gate at 42 °C is independent of the charger and still applies.
 
@@ -931,6 +945,26 @@ callback sends `WPT_SCAN_TIMEOUT` if `GetStat() == 1`, and `StateCharging` answe
 
 ---
 
+### 8.6 — 2026-09-10 IPG thermistor byte-wrap false thermal trips
+
+**Symptom.** Occasional pauses logged as `IPG temperature 50.00 C reached pause threshold (41 C)`, each coinciding with the BLE viewer showing the IPG temperature as "n/a". Logged raw values flipped from `ref=2550 out=2500 ofst=1280` (20 °C) to `ref=2550 out=0 ofst=1390` (resistance printed as 0, 50 °C).
+
+**Not bit loss.** Every BLE packet carries a CRC-24 and corrupted packets are discarded by the radio; the viewer and the charger independently decoded the same value, so the IPG transmitted it.
+
+**Root cause (IPG firmware, unchanged).** `app_mode_ble_active.c:137-139` clamps THERM_REF at 2550 mV but casts THERM_OUT and THERM_OFST straight to `uint8_t`, so they wrap at 2560 mV. THERM_OUT sits around 2.50 V on this board and occasionally crosses 2.56 V.
+
+**Fix (charger only, by decision — the IPG repo is not touched).**
+
+| File | Change |
+|------|--------|
+| `svc_wpt_manager.h/.cpp` | New `IsThermReadingPlausible()` and `THERM_OUT_WRAP_MAX_MV` (§6.5). `IpgTemperatureMonitoring()` calls it before computing a temperature; an implausible reading is logged and takes no pause/resume decision. The paused-dwell counter now advances before the check, so it keeps counting through rejected readings. The resistance log casts to `int32_t` (a negative float through NRF_LOG's `uint32_t` cast was undefined and printed 0) |
+
+Pause behaviour is otherwise unchanged: one plausible reading ≥ 41 °C still pauses; resume still needs the 30 s dwell and ≤ 39 °C.
+
+**Verification.** A host-side sweep of the rule against the IPG's packing accepted none of 14.2 M wrapped combinations (REF 2.40–3.60 V, OUT 2.55–3.60 V, OFST 0–2.55 V). Of 8,520 genuine design-range readings it rejected only 15, all with a thermistor resistance of about 10 kΩ (≈ 85 °C) — the floor's corner.
+
+**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not hardware-tested. Check: when the viewer shows "n/a", RTT should show `IPG thermistor reading implausible (…), ignored` with matching raw values and charging should continue.
+
 ## 9. Event Flow — Complete Happy Path
 
 ### 9.1 IPG already advertising (awake)
@@ -1093,6 +1127,7 @@ COLD_START_ESCALATE_MS         = 5000     // ms — step 7 → maximum, open loo
 IPG_TEMP_THRESHOLD_PAUSE       = 41       // °C — pause at/above
 IPG_TEMP_THRESHOLD_RESUME      = 39       // °C — resume at/below
 THERMAL_PAUSE_MIN_TICKS        = 15       // fault ticks (× 2 s) = 30 s dwell
+THERM_OUT_WRAP_MAX_MV          = 1040     // mV — THERM_OUT at/below this is a wrapped byte, rejected
 
 // OVP
 OVP_PAUSE_MIN_TICKS            = 5        // fault ticks (× 2 s) = 10 s dwell
@@ -1137,6 +1172,7 @@ WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idl
 
 - **Partial fault recovery:** Thermal and OVP faults now recover automatically (§6.5, §6.6). `WPT_FAULT_CONDITION` does not — it still sends `WPT_POWER_OFF` and falls to `StateIdle` with no retry and no user notification. A future enhancement could flash the LED or attempt a power cycle.
 
+- **IPG thermistor telemetry encoding (IPG firmware, deferred):** THERM_OUT / THERM_OFST are sent unclamped and wrap at 2.56 V; THERM_REF is clamped at 2.55 V. The charger now rejects the wraps (§6.5, §8.6), but with REF clamped its IPG temperature reads low and cannot be relied on to catch a real overtemperature — the IPG's own 42 °C gate is the effective limit. The proper fix is in the IPG: send the temperature it already computes (`app_mode_wpt.c:236`) in a spare MSD byte (msd[10] is currently 0), or widen the voltage encoding, and have the charger prefer it.
 - **Local NTC is unused *and* its conversion is broken:** `WPT_NTC` (AIN6) measures the charger PCB / transmit coil temperature. Two independent problems:
 
   1. **No control logic.** `mWptNtcTemperature` is written once in `hal_wpt.cpp:166` and read once in `app_system.cpp:74` inside a `LOG_INFO` on the 5 s heartbeat. There is no threshold, comparison, event, or state transition anywhere — the coil could overheat with no firmware response.

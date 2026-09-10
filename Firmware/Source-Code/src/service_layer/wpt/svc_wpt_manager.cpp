@@ -307,6 +307,46 @@ namespace svc
         SetPowerLevel(LEVEL_REQUEST_MAX);
     }
 
+    bool WptManager::IsThermReadingPlausible(uint16_t get_therm_ref,
+                                             uint16_t get_therm_out,
+                                             uint16_t get_therm_ofst)
+    {
+        // The IPG packs each value as (mV / 10) into one byte. REF is clamped at
+        // 255 (2550 mV) but OUT and OFST are not, so an OUT of 2560 mV or more
+        // wraps - what BLE viewers show as "n/a". The IPG's ADC cannot read above
+        // 3.6 V, so a wrapped OUT always decodes to 0..THERM_OUT_WRAP_MAX_MV, and
+        // the floor below rejects every wrap whatever OFST happens to be.
+
+        // Zero: a wrapped byte, or the IPG's thermistor circuit unpowered.
+        if (get_therm_ref == 0 || get_therm_out == 0 || get_therm_ofst == 0)
+        {
+            return false;
+        }
+
+        // Wrapped OUT. A genuine OUT this low would need the thermistor below
+        // ~9 kOhm (~90 C at the design OFST of ~0.8 V) - unreachable without
+        // first passing through the 41 C trip on an earlier reading.
+        if (get_therm_out <= THERM_OUT_WRAP_MAX_MV)
+        {
+            return false;
+        }
+
+        // No voltage across the thermistor.
+        if (get_therm_out <= get_therm_ofst)
+        {
+            return false;
+        }
+
+        // No current through the 49.9 kOhm sense resistor. Also catches OUT at
+        // 2550-2559 mV, which encodes as 255 - the same byte as the clamped REF.
+        if (get_therm_out >= get_therm_ref)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     float WptManager::CalculateTemperatureFromBle(uint16_t get_therm_ref,
                                                   uint16_t get_therm_out,
                                                   uint16_t get_therm_ofst)
@@ -325,7 +365,7 @@ namespace svc
         // Calculate thermistor resistance
         float resistance = voltage / current; // in kΩ
 
-        LOG_INFO("WPT Manager: IPG thermistor resistance: %d", resistance);
+        LOG_INFO("WPT Manager: IPG thermistor resistance: %d", (int32_t)resistance);
 
         // Handle out of range values first
         if (resistance >= TEMP_LOOKUP_TABLE[0].resistance)
@@ -373,6 +413,30 @@ namespace svc
         const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
         svc::ChargingStatusParameters_t ChargingStatusParameters = advData.chargingStatusParameters;
 
+        const bool thermally_paused = (m_pause_reasons & PAUSE_THERMAL) != 0;
+
+        // The dwell measures time, not readings, so it keeps counting through
+        // implausible samples below.
+        if (thermally_paused)
+        {
+            m_thermal_pause_ticks++;
+        }
+
+        // An implausible reading carries no temperature at all, so it can neither
+        // pause nor resume: whatever state we are in is held until a real reading
+        // arrives. Without this, a wrapped OUT byte computes as a negative
+        // resistance, maps to the table's hot end (50 C) and pauses on its own.
+        if (!IsThermReadingPlausible(ChargingStatusParameters.GET_THERM_REF,
+                                     ChargingStatusParameters.GET_THERM_OUT,
+                                     ChargingStatusParameters.GET_THERM_OFST))
+        {
+            LOG_WARNING("WPT Manager: IPG thermistor reading implausible (ref=%d out=%d ofst=%d mV), ignored - no thermal decision this tick\n",
+                        ChargingStatusParameters.GET_THERM_REF,
+                        ChargingStatusParameters.GET_THERM_OUT,
+                        ChargingStatusParameters.GET_THERM_OFST);
+            return;
+        }
+
         float ipg_temperature = CalculateTemperatureFromBle(ChargingStatusParameters.GET_THERM_REF, ChargingStatusParameters.GET_THERM_OUT, ChargingStatusParameters.GET_THERM_OFST);
 
         LOG_INFO("WPT Manager: IPG Temperature %d.%02d C\n",
@@ -382,8 +446,6 @@ namespace svc
            ChargingStatusParameters.GET_THERM_REF,
            ChargingStatusParameters.GET_THERM_OUT,
            ChargingStatusParameters.GET_THERM_OFST);
-
-        const bool thermally_paused = (m_pause_reasons & PAUSE_THERMAL) != 0;
 
         if (!thermally_paused)
         {
@@ -417,9 +479,8 @@ namespace svc
         // Held in a thermal pause. Resume needs both a minimum dwell and a genuine
         // recovery below the lower hysteresis threshold - the dwell alone would let
         // us re-enable into an implant that is still at the limit, producing a
-        // power burst cycle instead of a controlled hold.
-        m_thermal_pause_ticks++;
-
+        // power burst cycle instead of a controlled hold. (The dwell counter was
+        // advanced at the top, before the plausibility check.)
         if (m_thermal_pause_ticks < THERMAL_PAUSE_MIN_TICKS)
         {
             return;
