@@ -20,7 +20,7 @@
 
 #define TIMER_NAME "BleTimeoutTimer"
 #define SCAN_TIMEOUT_MS 10000            // Blue-light (StateScan) and StateCharge timeout
-#define SCAN_TIMEOUT_SLOW_CHARGE_MS 10000 // White-light (StateSlowChargeAndScan) timeout
+#define SCAN_TIMEOUT_SLOW_CHARGE_MS 30000 // White-light (StateSlowChargeAndScan) timeout
 #define PERIODIC 1
 #define ONESHOT 0
 

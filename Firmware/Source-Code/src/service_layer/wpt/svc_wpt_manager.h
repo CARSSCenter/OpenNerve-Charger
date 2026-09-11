@@ -255,7 +255,12 @@ namespace svc
 
         // How long the cold-start attempt stays at COLD_START_LEVEL before
         // escalating to maximum power for the rest of the scan window.
-        static constexpr uint32_t COLD_START_ESCALATE_MS = 5000;
+        static constexpr uint32_t COLD_START_ESCALATE_MS = 30000;
+
+        // Cold start: true  = if no IPG advertisement after COLD_START_ESCALATE_MS at
+        // COLD_START_LEVEL, jump to maximum power.
+        //false = stay at COLD_START_LEVEL for the whole white-light window.
+        static constexpr bool COLD_START_ESCALATION_ENABLED = false;
 
         /// Construct WptManager
         WptManager();

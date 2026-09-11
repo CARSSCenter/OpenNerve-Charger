@@ -29,7 +29,7 @@ There are 13 DAC steps (0–12), each corresponding to an increasing power trans
 | … | … | — |
 | 1100 mV | 7 | Cold-start level, and where the closed loop begins |
 | … | … | — |
-| 1600 mV | 12 (maximum) | Maximum — cold-start escalation target |
+| 1600 mV | 12 (maximum) | Maximum — cold-start escalation target (only if `COLD_START_ESCALATION_ENABLED`) |
 
 **CTD pin:** LTC4125 `CTD` (pin 14) has a 36 pF capacitor to GND, which sets the delay between OPS cycles. MCU pin **P0.05 (`WPT_CTD_CTRL`)** drives a MOSFET gate; when that MOSFET is on, it shorts the capacitor and ties `CTD` directly to GND.
 
@@ -138,7 +138,7 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
 | `WPT_FAULT_CONDITION` | 0x08 | Fault detected |
 | `WPT_BATTERY_CHARGING` | 0x09 | BLE confirms charging in progress |
 | `WPT_BATTERY_CHARGED` | 0x0B | BLE confirms all batteries full |
-| `WPT_SLOW_CHARGE` | 0x0C | Begin the open-loop cold-start attempt (step 7, escalating to max) |
+| `WPT_SLOW_CHARGE` | 0x0C | Begin the open-loop cold-start attempt (step 7; escalates to max only if `COLD_START_ESCALATION_ENABLED`, off by default) |
 | `WPT_SCAN_TIMEOUT` | 0x0D | Power search timed out |
 | `WPT_ADJUST_POWER` | 0x0E | Set specific DAC step. Handled in `StateCharging` and `StateSlowCharge`; **dropped** in `StateIdle` (§6.1) |
 | `WPT_FAULT_PAUSE` | 0x0F | Suspend coil output; `optDataAddress` carries the `PauseReason_e` (`PAUSE_THERMAL`, `PAUSE_OVP`, or in debug builds `PAUSE_MANUAL`) |
@@ -227,7 +227,7 @@ Exit:
   hal::Leds::LedScanOn(false)
 ```
 
-When no IPG is found within the 10-second scan window, the charger assumes the IPG may be powered off. It enters `StateSlowChargeAndScan`, which drives the coil hard enough to boot a drained IPG from wireless power, then scans for another 10 seconds to catch the BLE advertisement after initialization.
+When no IPG is found within the 10-second scan window, the charger assumes the IPG may be powered off. It enters `StateSlowChargeAndScan`, which drives the coil at step 7 to boot a drained IPG from wireless power, then scans for up to 30 seconds to catch the BLE advertisement after initialization.
 
 Note the ordering: `ChangeState` runs `StateScan::Exit()` (which sends `WPT_POWER_ON`, taking the WPT SM from `StateIdle` to `StateCharging`) *before* `StateSlowChargeAndScan::Entry()` sends `WPT_SLOW_CHARGE`. So `WPT_SLOW_CHARGE` is always handled by `StateCharging`, never by the WPT SM's own `StateSlowCharge` — see §11.
 
@@ -235,9 +235,9 @@ Note the ordering: `ChangeState` runs `StateScan::Exit()` (which sends `WPT_POWE
 
 ```
 Entry:
-  BleManager::SetScanTimeout(10000)     ← 10 s window for IPG boot time
+  BleManager::SetScanTimeout(30000)     ← 30 s window for IPG boot time
   BlePort::START_SCANNING
-  WptPort::WPT_SLOW_CHARGE              ← cold start: step 7, escalating to max at 5 s
+  WptPort::WPT_SLOW_CHARGE              ← cold start: step 7 (escalation to max off by default)
   PmcPort::PMC_POWER_ON                 ← VCC_EN high (5V rail for LTC4125)
   hal::Leds::LedChargingSlow(true)      ← white LED
 
@@ -265,15 +265,22 @@ DispatchEvent:
     → ChangeState(StateManual)
 
 Exit:
-  BleManager::SetScanTimeout(10000)     ← restore default (same value since the change below)
+  BleManager::SetScanTimeout(10000)     ← restore default SCAN_TIMEOUT_MS
   hal::Leds::LedChargingSlow(false)
 ```
 
-**Cold-start power profile:** `WPT_SLOW_CHARGE` no longer clamps the DAC to minimum. Minimum power (step 0, 400 mV) was never enough to bring a fully drained IPG's VRECT up to boot, which is the entire purpose of this state. Instead `WptManager::StartColdStartEscalation()` drives step 7 immediately and starts a 5 s one-shot timer; if no advertisement has been parsed by then, it escalates to maximum power for the remainder of the window.
+**Cold-start power profile:** `WPT_SLOW_CHARGE` no longer clamps the DAC to minimum. Minimum power (step 0, 400 mV) was never enough to bring a fully drained IPG's VRECT up to boot, which is the entire purpose of this state. Instead `WptManager::StartColdStartEscalation()` drives step 7 immediately. Escalating to maximum power is optional, controlled by `COLD_START_ESCALATION_ENABLED` in `svc_wpt_manager.h`:
 
-This window is open-loop by necessity — with no BLE there is no PGOOD and no OVP telemetry, so nothing can be steered by. The escalation callback self-guards on `BleManager::GetAdvertisementCount() == 0`, so if an advertisement arrives while the timer is pending it fires harmlessly and the closed loop keeps ownership of the power level. That removes any need to cancel the timer on the BLE-found path.
+| `COLD_START_ESCALATION_ENABLED` | Behaviour |
+|---|---|
+| `false` (default since 2026-09-11) | Step 7 for the whole scan window; the escalation timer is never started. If step 7 cannot boot a drained IPG, the window times out and the charger returns to `StateWait` |
+| `true` | Also starts a one-shot `COLD_START_ESCALATE_MS` timer; if no advertisement has been parsed by then, it escalates to maximum power for the remainder of the window |
 
-The scan window was shortened from 30 s to 10 s at the same time. If wake-up of a drained IPG starts failing after this change, this is the first constant to lengthen — max power shortens the IPG's boot time but not the time it needs to start advertising afterwards.
+**If you enable it, `COLD_START_ESCALATE_MS` must be well below `SCAN_TIMEOUT_SLOW_CHARGE_MS`.** Both are currently 30 s. The scan timeout ends the state through `DisableWpt()`, which stops the escalation timer, so with equal values the escalation either never fires or lasts only milliseconds before the coil turns off.
+
+This window is open-loop by necessity — with no BLE there is no PGOOD and no OVP telemetry, so nothing can be steered by. When enabled, the escalation callback self-guards on `BleManager::GetAdvertisementCount() == 0`, so if an advertisement arrives while the timer is pending it fires harmlessly and the closed loop keeps ownership of the power level. That removes any need to cancel the timer on the BLE-found path.
+
+§8.3 shortened the scan window from 30 s to 10 s alongside the escalation; on 2026-09-11 it went back to 30 s with escalation off by default (§8.7). If wake-up of a drained IPG fails at step 7, the two levers are this window (`SCAN_TIMEOUT_SLOW_CHARGE_MS`) and escalation — max power shortens the IPG's boot time but not the time it needs to start advertising afterwards.
 
 **Key design decisions on BLE_DEVICE_FOUND:** When the IPG is detected, WPT and VCC are left enabled intentionally. `StateCharge::Entry()` sends `WPT_POWER_ON` to ensure the WPT service is in `StateCharging` regardless of which path led here, and `PMC_POWER_ON` is a no-op in `PmcStateEnable` (PMC was already enabled in this state's `Entry()`). This avoids any disable/enable round-trip that would briefly cut power to the still-booting IPG.
 
@@ -377,7 +384,7 @@ Thermal and OVP are warn-only (§6.5, §6.6), the raw IPG fault bits are logged 
 |---|---|---|
 | `StateWait` | nothing | worked |
 | `StateScan` | `WPT_POWER_ON` | coil came on once VCC_EN rose |
-| `StateSlowChargeAndScan` | nothing — coil already on | coil stayed on; a pending cold-start escalation could take it to step 12 |
+| `StateSlowChargeAndScan` | nothing — coil already on | coil stayed on; a pending cold-start escalation (only with `COLD_START_ESCALATION_ENABLED`) could take it to step 12 |
 | `StateCharge` | `WPT_POWER_OFF` | its `DisableWpt()` stopped the fault timer `Entry()` had just started |
 
 `WPT_MANUAL_IDLE` is queued behind those events on the same port, so FIFO order makes it the last word; its handler is `WptManager::EnterManualIdle()`. A cold-start escalation expiring at the same moment cannot leave the level at step 12: `DisableWpt()` posts the timer's stop before `ResetPowerControl()`, and the FreeRTOS timer task (priority 2) preempts the WPT task (1) on that post, so the escalation runs before the reset, not after. The one visible residue is entry from `StateScan`, whose queued `WPT_POWER_ON` still drives `WPT_ENn` low for well under a millisecond before `WPT_MANUAL_IDLE` is processed — normally with VCC_EN still off, since `StateScan` never raises it.
@@ -404,9 +411,9 @@ Two states:
 | Constant | Value | Used in |
 |----------|-------|---------|
 | `SCAN_TIMEOUT_MS` | 10,000 ms | `StateScan`, `StateCharge` |
-| `SCAN_TIMEOUT_SLOW_CHARGE_MS` | 10,000 ms | `StateSlowChargeAndScan` |
+| `SCAN_TIMEOUT_SLOW_CHARGE_MS` | 30,000 ms | `StateSlowChargeAndScan` |
 
-`SetScanTimeout(ms)` must be called before `StartScanning()` (or between advertisements) to take effect. `StateSlowChargeAndScan::Entry()` calls it with `SCAN_TIMEOUT_SLOW_CHARGE_MS`; `StateSlowChargeAndScan::Exit()` restores `SCAN_TIMEOUT_MS`. The two are currently equal, but the calls are kept distinct so the cold-start window can be retuned independently.
+`SetScanTimeout(ms)` must be called before `StartScanning()` (or between advertisements) to take effect. `StateSlowChargeAndScan::Entry()` calls it with `SCAN_TIMEOUT_SLOW_CHARGE_MS`; `StateSlowChargeAndScan::Exit()` restores `SCAN_TIMEOUT_MS`. The cold-start window is currently the longer of the two (30 s vs 10 s).
 
 **Advertisement counter.** `BleManager` maintains `mAdvertisementCounter`, incremented in `ParseManufacturerSpecificData()` immediately after the payload fields are written and before `DEVICE_FOUND` is sent, exposed via `GetAdvertisementCount()`. Ordering matters: any consumer that observes a new count is guaranteed to see the data that arrived with it.
 
@@ -965,6 +972,24 @@ Pause behaviour is otherwise unchanged: one plausible reading ≥ 41 °C still p
 
 **Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not hardware-tested. Check: when the viewer shows "n/a", RTT should show `IPG thermistor reading implausible (…), ignored` with matching raw values and charging should continue.
 
+### 8.7 — 2026-09-11 Cold-start escalation made optional
+
+The jump to maximum power during cold start is now behind a build-time flag, off by default, and the white-light scan window is back at 30 s.
+
+| File | Change |
+|------|--------|
+| `svc_wpt_manager.h` | New `COLD_START_ESCALATION_ENABLED` (`false`). `COLD_START_ESCALATE_MS` 5,000 → 30,000 ms |
+| `svc_wpt_manager.cpp` | `StartColdStartEscalation()` still sets step 7, but starts `mColdStartEscalateTimer` only when the flag is `true`; otherwise it logs `Cold start at level 7, escalation disabled` |
+| `svc_ble_manager.h` | `SCAN_TIMEOUT_SLOW_CHARGE_MS` 10,000 → 30,000 ms |
+
+Nothing else needed changing: `StartColdStartEscalation()` is the only place the timer is started, and the `Stop()` in `DisableWpt()` is harmless on a timer that never ran. `ColdStartEscalate()` and `LEVEL_REQUEST_MAX` remain for the enabled case.
+
+With the flag off, a drained IPG gets step 7 (1100 mV) for 30 s; if it has not advertised by then, the charger returns to `StateWait`. To re-enable escalation, set the flag to `true` **and** make `COLD_START_ESCALATE_MS` shorter than `SCAN_TIMEOUT_SLOW_CHARGE_MS` (§4.5).
+
+This also resolves the §11 note about `state_slow_charge_and_scan.cpp:29` ("a longer scan timeout"): the slow-charge window is again longer than the default, so the comment is accurate.
+
+**Status.** Compiles clean (syntax check of all 53 first-party sources, `WPT_MANUAL_DEBUG_MODE` = 1 as currently set). Not hardware-tested.
+
 ## 9. Event Flow — Complete Happy Path
 
 ### 9.1 IPG already advertising (awake)
@@ -1018,13 +1043,14 @@ User presses button
 No IPG found — BLE_SCAN_TIMEOUT fires
   → StateScan → StateSlowChargeAndScan
   → StateSlowChargeAndScan::Entry():
-      SetScanTimeout(10 s)
+      SetScanTimeout(30 s)
       BlePort::START_SCANNING
       WptPort::WPT_SLOW_CHARGE     ← cold start: LTC4125 at step 7
       white LED on
 
-After 5 s with no advertisement
-  → ColdStartEscalate(): LTC4125 to maximum power for the remaining 5 s
+Only if COLD_START_ESCALATION_ENABLED (off by default):
+After COLD_START_ESCALATE_MS with no advertisement
+  → ColdStartEscalate(): LTC4125 to maximum power for the rest of the window
 
 WPT powers IPG; IPG boots, starts advertising
   → BleManager receives advertisement
@@ -1032,14 +1058,14 @@ WPT powers IPG; IPG boots, starts advertising
   → App SM: StateSlowChargeAndScan → StateCharge
       WPT and VCC left enabled (no WPT_POWER_OFF or PMC_POWER_OFF sent)
   → StateSlowChargeAndScan::Exit():
-      SetScanTimeout(10 s), white LED off
+      SetScanTimeout(10 s) (restore default), white LED off
   → StateCharge::Entry():
       PMC_POWER_ON (no-op — PMC already in PmcStateEnable), yellow LED
       WptPort::WPT_POWER_ON       ← transitions WPT SM from any state to StateCharging
       StartIpgTemperaturePgoodMonitoringTimer()
 
 First 10 s control cycle with telemetry
-  → level snaps to step 7, closed loop takes over from the cold-start escalation
+  → level snaps to step 7 if escalation moved it; closed loop takes over from the open-loop cold start
 
 ... charging proceeds as normal ...
 ```
@@ -1112,7 +1138,7 @@ Operator presses 'n'
 SCAN_INTERVAL              = 0x00A0
 SCAN_WINDOW                = 0x0050
 SCAN_TIMEOUT_MS            = 10000     // ms — StateScan and StateCharge
-SCAN_TIMEOUT_SLOW_CHARGE_MS = 10000   // ms — StateSlowChargeAndScan
+SCAN_TIMEOUT_SLOW_CHARGE_MS = 30000   // ms — StateSlowChargeAndScan
 CARSS_COMPANY_ID           = 0xF0F0   // Production IPG company ID
 ```
 
@@ -1121,7 +1147,8 @@ CARSS_COMPANY_ID           = 0xF0F0   // Production IPG company ID
 // Timers
 FAULT_MONITOR_PERIOD_MS        = 2000     // ms — temperature + OVP sampling
 POWER_CTRL_PERIOD_MS           = 10000    // ms — power search step interval
-COLD_START_ESCALATE_MS         = 5000     // ms — step 7 → maximum, open loop
+COLD_START_ESCALATE_MS         = 30000    // ms — step 7 → maximum, open loop (only if enabled below)
+COLD_START_ESCALATION_ENABLED  = false    // jump to max during cold start; needs ESCALATE_MS < SCAN_TIMEOUT_SLOW_CHARGE_MS
 
 // Thermal (single hysteresis band + dwell)
 IPG_TEMP_THRESHOLD_PAUSE       = 41       // °C — pause at/above
@@ -1184,6 +1211,5 @@ WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idl
 
 - **VCC_EN stays high after leaving `StateCharge`:** `StateCharge::Exit()` sends no `PMC_POWER_OFF` (§4.6), so after a completed charge or a button press the LTC4125 remains powered, though disabled, in `StateWait`.
 
-- **Stale comment on the slow-charge scan window:** `state_slow_charge_and_scan.cpp:29` still says the state uses "a longer scan timeout so the IPG has time to power up". `SCAN_TIMEOUT_SLOW_CHARGE_MS` has equalled `SCAN_TIMEOUT_MS` (10 s) since §8.3 deliberately shortened it.
 
 - **`WptManager::RearmPowerSearch()` has no callers** (§6.2) — kept deliberately, but dead code today.

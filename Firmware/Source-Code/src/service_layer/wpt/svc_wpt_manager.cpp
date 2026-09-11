@@ -289,7 +289,15 @@ namespace svc
         LOG_INFO("WPT Manager: Cold start at level %d, escalating to max in %d ms if no IPG advertisement\n",
                  COLD_START_LEVEL, COLD_START_ESCALATE_MS);
         SetPowerLevel(COLD_START_LEVEL);
-        mColdStartEscalateTimer.Start();
+      if (COLD_START_ESCALATION_ENABLED)
+      {
+          LOG_INFO("WPT Manager: Cold start at level %d, escalating to max in %d ms if no IPG advertisement\n",
+                   COLD_START_LEVEL, COLD_START_ESCALATE_MS);
+          mColdStartEscalateTimer.Start();
+      } else
+      {
+          LOG_INFO("WPT Manager: Cold start at level %d, escalation disabled\n", COLD_START_LEVEL);
+      }
     }
 
     void WptManager::ColdStartEscalate(TimerHandle_t xTimer)
