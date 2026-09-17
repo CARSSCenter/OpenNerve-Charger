@@ -310,7 +310,8 @@ DispatchEvent:
     BlePort::START_SCANNING             ← restart scan, do NOT exit charge state
 
   WPT_SCAN_TIMEOUT:
-    → ChangeState(StateWait)            ← UNREACHABLE: see §11, GetStat() is a stub
+    → ChangeState(StateWait)            ← only sender today: thermal blind-retry give-up (§6.5);
+                                          the GetStat() path is a stub (§11)
 
   BUTTON_DFU_PRESSED:
     hal::Dfu::start_dfu_mode()
@@ -351,7 +352,7 @@ DispatchEvent:
   TURN_OFF:            → ChangeState(StateWait)   ← console 'n' — the only way out
   BUTTON_PRESSED:      ignored, logged            ← Button 1 disabled in manual mode
   BLE_SCAN_TIMEOUT:    BlePort::START_SCANNING    ← re-arm, no state change
-  BATTERY_CHARGED:     BlePort::START_SCANNING    ← undo ProcessNewBleData()'s STOP_SCANNING
+  BATTERY_CHARGED:     BlePort::START_SCANNING    ← re-arm; redundant since 2026-09-17 (§8.8), harmless
   BUTTON_DFU_PRESSED:  hal::Dfu::start_dfu_mode()
   (WPT_SCAN_TIMEOUT and BLE_DEVICE_FOUND deliberately absent)
 
@@ -466,6 +467,8 @@ index+27          msd[23] Hardware version
 BATTERY_VOLTAGE_MEASURED = (BattA_mV) | (BattB_mV << 16)
 where BattA_mV = msd[1] * 100,  BattB_mV = msd[2] * 100
 ```
+
+`ProcessNewBleData()` splits it back into the two channels for logging (`Battery voltage measured: BattA=… mV BattB=… mV`) and for charge-completion detection (§7). On the current IPG, BattA is unpopulated and reads 0–200 mV; the combined value printed as one integer before 2026-09-17 (e.g. `163840000 mV` = BattB 2500 mV) was unreadable.
 
 ---
 
@@ -644,9 +647,11 @@ MAX_VOLTAGE_STEP          = 12   // maximum DAC step (from the HAL)
 
 ### 6.4 Battery Charged Handling — Race Condition Avoidance
 
-When the IPG reports all batteries full (`CHG1_STATUS = 1` AND `CHG2_STATUS = 1` AND `VCHG_PGOOD = 1`), the application layer sends `BATTERY_CHARGED` to the system port. `StateCharge::Exit()` then sends `WPT_POWER_OFF` through the normal port path.
+When the IPG reports all batteries full (§7), the application layer sends `BATTERY_CHARGED` to the system port. `StateCharge::Exit()` then sends `WPT_POWER_OFF` and `STOP_SCANNING` through the normal port path.
 
 `StateCharging::DispatchEvent` receives `WPT_BATTERY_CHARGED` but deliberately does **not** send `WPT_POWER_OFF` directly. Doing so would race with the `SlowChargeAndScan → Charge` transition: multiple `DEVICE_FOUND` events can be queued while `STOP_SCANNING` is still pending, and a second `WPT_BATTERY_CHARGED` would disable WPT after `StateCharge::Entry()` has already re-enabled it via `WPT_POWER_ON`. Routing all shutdown through the application layer's `StateCharge::Exit()` avoids this.
+
+**Scanning is stopped the same way (2026-09-17).** `ProcessNewBleData()` used to send `STOP_SCANNING` itself, in every application state. Only `StateCharge` acts on `BATTERY_CHARGED`; `StateScan` and `StateSlowChargeAndScan` ignore it. A drained IPG's first advertisement arrives in `StateSlowChargeAndScan` — and read as "charged" (§7) — so the scan was stopped, `BLE_DEVICE_FOUND` then moved the app into `StateCharge` with the coil on, and because `StopScanning()` also stops the scan timeout timer, `StateCharge`'s `BLE_SCAN_TIMEOUT` restart never ran. The coil stayed on at step 7 with no telemetry for the rest of the session (`Power control skipped, no new IPG advertisement since last step` every 10 s, IPG temperature frozen). Now only `StateCharge::Exit()` stops scanning. See §8.8.
 
 ### 6.5 IPG Temperature Monitoring
 
@@ -669,6 +674,7 @@ This loop acts on the **IPG's** temperature, broadcast over BLE — not the char
 | Paused, dwell < 30 s | Hold — no resume regardless of temperature |
 | Paused, dwell ≥ 30 s, temp > 39 °C (`IPG_TEMP_THRESHOLD_RESUME`) | Hold — keep waiting |
 | Paused, dwell ≥ 30 s **and** temp ≤ 39 °C | `WPT_FAULT_RESUME(PAUSE_THERMAL)` — coil re-enabled |
+| Paused, temp > 39 °C, **no new advertisement since the pause** | Blind retry after 30 / 60 / 120 / 240 s — see below |
 
 The dwell is counted in fault-timer ticks (`THERMAL_PAUSE_MIN_TICKS = 15` × 2 s). Both conditions are required: the dwell alone would allow re-enabling into an implant still sitting at the limit, producing a power-burst cycle rather than a controlled hold, while the threshold alone gave no guaranteed cool-down time.
 
@@ -690,6 +696,22 @@ The dwell is counted in fault-timer ticks (`THERMAL_PAUSE_MIN_TICKS = 15` × 2 s
 Because every wrap is caught by construction, no debounce is needed: a single *plausible* reading at or above 41 °C still pauses immediately.
 
 **Limitation — the charger reads low while REF is clamped.** On the board where this was diagnosed THERM_REF reads exactly 2550 in every advertisement, and a wrapped OUT (≥ 2560 mV) proves the real REF is higher. The charger therefore underestimates the sense-resistor drop, overestimates the resistance (≈ 1.2 MΩ) and reads **cold** — the "20.00 C" in normal logs is the table's cold-end clamp, not a measurement. An accepted reading is a lower bound on the true temperature: a ≥ 41 °C reading is always genuine, but a real overtemperature may go unseen. The IPG's own 42 °C gate uses the full 16-bit mV values and is unaffected; it is the effective thermal limit until the IPG encoding is fixed (§11).
+
+**Blind thermal retry — coil-powered IPG (2026-09-17).** Below ~3.2 V the IPG has no usable battery and runs directly from the rectified coil voltage. A thermal pause turns the coil off, the IPG shuts down, and no new advertisement can ever arrive; the stored reading is the one that caused the pause, so the resume branch above was unreachable and the charger sat paused until a button press (seen on hardware: 48.47 °C, then 0 advertisements). The 48 °C reading is treated as genuine throughout.
+
+"The IPG is dark" is decided from the advertisement counter, not the battery voltage (the last BattB is itself stale): `m_thermal_pause_adv_count` is recorded when the pause starts, and an unchanged count means nothing has been heard since. An IPG running on its battery keeps advertising while paused, never takes this path, and resumes only on a real ≤ 39 °C reading as before.
+
+| Step | Action |
+|------|--------|
+| Paused, dark, dwell ≥ `THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count` (30, 60, 120, 240 s) | Step down one level (unless the last retry failed for lack of an advertisement), clear `m_floor_found`, set `m_blank_cycles`, start a probe, `WPT_FAULT_RESUME(PAUSE_THERMAL)`. Logs `IPG silent for N ticks in thermal pause, blind retry k/4 at level L` |
+| Probe running, no new advertisement | The stale reading is ignored — it would otherwise re-pause on the next tick |
+| Probe running, no advertisement within 20 s (`THERMAL_PROBE_TIMEOUT_TICKS`) | Failed (`no advertisement`): the level was too low to boot the IPG. Re-pause and queue one step **up**, never above `m_thermal_trip_level` (the level that first tripped) |
+| Probe running, first fresh plausible reading **> 39 °C** | Failed (`still hot`): re-pause. The retry skipped the cool-down check, so the first real reading must meet the *resume* threshold, not just stay under 41 °C |
+| Probe running, first fresh reading ≤ 39 °C | `Blind thermal retry confirmed`; retry count reset; charging continues and the power loop takes over |
+| Probe running, fresh reading implausible | Keep waiting for the next advertisement, same 20 s bound |
+| Paused, dark, `m_thermal_retry_count` = 4 (`THERMAL_BLIND_RETRY_MAX`) | `IPG silent after 4 blind thermal retries, ending charge session`; sends `WPT_SCAN_TIMEOUT` → `StateCharging` powers off, `StateCharge` → `StateWait` |
+
+The coil is on only for the few seconds a drained IPG needs to boot and advertise (~1 s after cold start in the 2026-09-17 logs) before a hot reading re-pauses it, and the doubling back-off bounds the heating duty cycle over the minutes an implant takes to cool. The helper is `FailThermalProbe()`; all probe state is cleared in `ResetPowerControl()`. Hardware-tested 2026-09-17 (thresholds temporarily lowered to force pauses, IPG removed to force the give-up path, healthy-battery IPG unaffected).
 
 **In debug-build manual mode (§4.7)** the temperature is still computed and logged every 2 s. Crossing 41 °C logs `[MANUAL] WARN thermal: … (ignored)` but sends no `WPT_FAULT_PAUSE`. The IPG's own thermal gate at 42 °C is independent of the charger and still applies.
 
@@ -722,6 +744,7 @@ const bool chg2_ovp  = (p.GET_CHG2_OVP_ERR == 0);  // logged on change only
 | New advertisement, a `CHGx_OVP_ERRn` changed | Log it — WARNING on assert, INFO on clear, with level and PGOOD. Coil unaffected |
 | Same advertisement as last tick | Ignored — only fresh telemetry can report a new fault |
 | Dwell < 10 s (`OVP_PAUSE_MIN_TICKS = 5`) | Hold |
+| Dwell ≥ 10 s, no new advertisement since the pause | IPG dark (coil-powered): stored `VRECT_OVPn` is stale — log `IPG silent … in OVP pause, treating fault as cleared` and take the resume row below |
 | Dwell ≥ 10 s, `VRECT_OVPn` still 0 | Hold, log at WARNING |
 | Dwell ≥ 10 s, `VRECT_OVPn` cleared | Step level down one, set `m_blank_cycles`, `WPT_FAULT_RESUME(PAUSE_OVP)` |
 
@@ -744,6 +767,8 @@ Both battery flags are reported only when they change, so a flag stuck asserted 
 
 **Why the blanking cycle exists.** When the IPG re-enables, its VCHG rail needs a moment to recover, so for one or two samples PGOOD reads 0 while OVP has already cleared. That is precisely the "add power" condition, and acting on it would undo the back-off and re-trip the fault immediately. `BLANK_CYCLES_AFTER_FAULT` makes the power loop skip a cycle after any fault resume.
 
+**Coil-powered IPG (2026-09-17).** A drained IPG goes dark when the coil stops, so the last advertisement — the one reporting the fault — was re-read forever and the pause never ended. `m_ovp_pause_adv_count` is recorded at pause; if it is unchanged after the 10 s dwell, the charger resumes one step down through the normal back-off path. The recorded ceiling keeps the power loop from climbing back into the fault. OVP carries no heating risk, so there is no back-off schedule or retry limit here (compare §6.5).
+
 **Timing note.** The charger's 10 s pause is longer than the IPG's own 5 s hold, so the IPG re-enables first. This is safe: the charger's coil is off throughout its pause, VRECT is at zero, and `VRECT_OVPn` is therefore guaranteed clear by the time the charger resumes (one step lower after a rectifier OVP). It is more conservative than the handshake strictly requires — the IPG's stated expectation is a *power reduction*, not a coil shutdown — at the cost of ~10 s of charging per trip.
 
 **In debug-build manual mode (§4.7)** OVP is still detected and a rectifier OVP still records `m_ovp_ceiling`, but the charger neither pauses nor steps down; it logs `[MANUAL] WARN ovp: VRECT_OVPn=0 at level …, charged to …, ceiling …, ignored` instead. The IPG's own response is unaffected — it still sets `VCHG_DISABLE`, so PGOOD still drops. That is why manual mode prints the raw IPG fault bits, including `CHG1_OVP_ERRn` and `CHG2_OVP_ERRn`, on every fault tick: it is the only way to tell an IPG protecting itself from a command that did not take effect.
@@ -752,27 +777,40 @@ Both battery flags are reported only when they change, so a flag stuck asserted 
 
 ## 7. Charging Completion Detection
 
-`ProcessNewBleData()` in `app_state_machine.cpp` is called each time a fresh IPG advertisement arrives. It reads `CHG1_STATUS`, `CHG2_STATUS`, and `VCHG_PGOOD` from the parsed advertisement data:
+`ProcessNewBleData()` in `app_state_machine.cpp` is called each time a fresh IPG advertisement arrives. It reads `CHG1_STATUS`, `CHG2_STATUS`, `VCHG_PGOOD` and both battery voltages (§5.3):
 
 ```cpp
-bool chg1_charging = (CHG1_STATUS == 0);   // 0 = nCHRG pulled low = actively charging
-bool chg2_charging = (CHG2_STATUS == 0);
-bool pgood         = (VCHG_PGOOD == 1);
-bool all_done      = !chg1_charging && !chg2_charging;
+BATTERY_FULL_MV    = 4100;   // LTC4065 float is 4.2 V; advertisement resolution 100 mV
+BATTERY_PRESENT_MV = 1000;   // below this the channel has no battery
 
-if (all_done && pgood)
+battX_measured = (battX_mV >= BATTERY_PRESENT_MV);
+battX_done     = (CHGx_STATUS == 1) && (battX_mV >= BATTERY_FULL_MV);
+
+all_done = pgood
+        && (battA_measured || battB_measured)
+        && (!battA_measured || battA_done)
+        && (!battB_measured || battB_done);
+
+if (all_done)
     → WptPort::WPT_BATTERY_CHARGED     (no-op in StateCharging — see §6.4)
-    → BlePort::STOP_SCANNING
-    → SystemPort::BATTERY_CHARGED
+    → SystemPort::BATTERY_CHARGED      (acted on only in StateCharge)
 else
     → WptPort::WPT_BATTERY_CHARGING
 ```
 
-Note the still-charging branch sends `WPT_BATTERY_CHARGING` on the **WPT** port, not a system event — there is no `BATTERY_CHARGING` in `SystemPort::Event_e`. The completion branch sends three events, and only the last of the three is what actually drives the application state machine to `StateWait`.
+Both log lines carry `CHG1`, `CHG2`, `PGOOD`, `BattA` and `BattB`. The still-charging branch sends `WPT_BATTERY_CHARGING` on the **WPT** port, not a system event — there is no `BATTERY_CHARGING` in `SystemPort::Event_e`. The completion branch no longer sends `STOP_SCANNING` (§6.4).
 
-The `PGOOD` qualifier is essential: when the charger first enters `StateCharge`, the IPG's boost converter may not yet be in regulation and `CHGx_STATUS` can read 1 (idle) before the charger ICs have actually started. Requiring `PGOOD = 1` ensures that a charge-complete reading is only accepted when the converter is confirmed active.
+**Why the voltage is required (2026-09-17).** `CHGx_STATUS = 1` only means the LTC4065's `nCHRG` pin is floating. Observed on hardware:
 
-The LTC4065 charger ICs in the IPG handle their own charge termination (C/10 cutoff) and autonomous re-charge — the charger firmware never instructs them directly. `CHGx_STATUS` reading 1 means only that the IC's `nCHRG` pin is floating (charge complete or not yet started); combined with `PGOOD = 1`, it reliably indicates charge complete.
+| Readings | Meaning |
+|----------|---------|
+| CHG = 0, PGOOD = 1 | Charging (every normal session) |
+| CHG = 1, PGOOD = 0 | Charger IC unpowered — CHG1 *and* CHG2 read 1 whenever PGOOD is 0 |
+| CHG1 = 1, CHG2 = 1, PGOOD = 1, BattB = 2.5–2.8 V | Deeply discharged battery (probably LTC4065 trickle/precharge — not confirmed on the IPG side) |
+
+The old rule (all CHG = 1 and PGOOD = 1) called the third row "charged". Requiring every present battery to read ≥ 4.1 V separates it from a real full battery. A channel below 1 V is treated as absent: the current IPG has no battery A, and BattA reads 0–200 mV (a plain `!= 0` test would have counted it as a battery that never fills, so the session would never end on its own). If no channel reads a present battery — e.g. the first advertisement after boot, which reported 0 mV — nothing is concluded and charging continues; the LTC4065 terminates its own charge (C/10 cutoff) and the IPG has its own thermal protection.
+
+The charger firmware never instructs the LTC4065 charger ICs directly; they handle their own termination and autonomous re-charge.
 
 ---
 
@@ -990,6 +1028,27 @@ This also resolves the §11 note about `state_slow_charge_and_scan.cpp:29` ("a l
 
 **Status.** Compiles clean (syntax check of all 53 first-party sources, `WPT_MANUAL_DEBUG_MODE` = 1 as currently set). Not hardware-tested.
 
+### 8.8 — 2026-09-17 Drained-IPG charging: stuck scan, false "charged", pause deadlock
+
+**Symptom.** With an IPG battery below 3.2 V, charging started but the charger then ignored all further advertisements (visible in a BLE viewer) and logged `Power control skipped, no new IPG advertisement since last step` every 10 s. No power or temperature control ran; the IPG temperature stayed frozen at 20.00 °C; only the IPG's own thermal gate still acted.
+
+**Root causes.**
+
+1. *False "charged".* A 2.5 V battery reports CHG1 = 1, CHG2 = 1, PGOOD = 1, which the completion rule accepted as full (§7).
+2. *Scan stopped outside `StateCharge`.* `ProcessNewBleData()` sent `STOP_SCANNING` directly. The first advertisement from a drained IPG arrives in `StateSlowChargeAndScan`, which ignores `BATTERY_CHARGED`; the scan and its timeout timer stopped, `BLE_DEVICE_FOUND` moved the app into `StateCharge` with the coil on, and nothing restarted the scan (§6.4).
+3. *Pause deadlock (found after 1–2 were fixed).* A coil-powered IPG goes dark when a thermal or OVP pause turns the coil off, so the stale reading that caused the pause is re-evaluated forever (§6.5, §6.6). Seen as a 48.47 °C thermal pause that never ended.
+
+**Fix.**
+
+| File | Change |
+|------|--------|
+| `app_state_machine.cpp` | `STOP_SCANNING` removed from `ProcessNewBleData()`. Completion requires every present battery (≥ `BATTERY_PRESENT_MV` = 1000 mV) to read ≥ `BATTERY_FULL_MV` = 4100 mV with CHG = 1, plus PGOOD; no present battery → keep charging. BattA / BattB logged separately |
+| `svc_wpt_manager.h/.cpp` | Blind thermal retry (`THERMAL_BLIND_RETRY_BASE_TICKS`, `THERMAL_BLIND_RETRY_MAX`, `THERMAL_PROBE_TIMEOUT_TICKS`, `FailThermalProbe()`, probe state cleared in `ResetPowerControl()`). OVP pause resumes one step down when no advertisement has arrived during the 10 s dwell |
+
+**Status.** Hardware-tested 2026-09-17 (commit `db8b343`). Scanning continued throughout a drained-IPG session (94 advertisements, all correctly "in progress", closed loop running). Blind retry, give-up after four failures, and unchanged behaviour with a healthy battery were confirmed on the bench.
+
+**Not done — keep-alive level during a pause.** Instead of turning the coil off, drop to a level at which the IPG stays powered with PGOOD = 0 (many such advertisements appear in the logs), so it keeps reporting temperature and the blind period disappears. The coil itself heats the implant, so this needs bench thermal measurements first.
+
 ## 9. Event Flow — Complete Happy Path
 
 ### 9.1 IPG already advertising (awake)
@@ -1027,7 +1086,7 @@ Every 10 s (mPowerCtrlTimer): PowerControlMonitoring()
   → PGOOD=1, floor found:     hold
   → PGOOD=0 twice running:    step up, record pgood_floor, floor found
 
-IPG advertisement: CHG1_STATUS=1, CHG2_STATUS=1, PGOOD=1
+IPG advertisement: every present battery CHG=1 and ≥ 4.1 V, PGOOD=1 (§7)
   → ProcessNewBleData() → SystemPort::BATTERY_CHARGED
   → App SM: StateCharge → StateWait
   → StateCharge::Exit(): BlePort::STOP_SCANNING, WptPort::WPT_POWER_OFF, yellow LED off
@@ -1118,8 +1177,9 @@ Every 10 s with no IPG (BLE_SCAN_TIMEOUT)
 Button 1
   → ignored in StateManual (logged); Button 2 still resets the MCU
 
-IPG reports battery charged (ProcessNewBleData() sends STOP_SCANNING)
-  → StateManual re-sends START_SCANNING on BATTERY_CHARGED
+IPG reports battery charged
+  → StateManual re-sends START_SCANNING on BATTERY_CHARGED (redundant since §8.8 —
+    ProcessNewBleData() no longer stops scanning)
 
 Operator presses 'n'
   → DebugConsole::ExitManual(): request only
@@ -1155,6 +1215,9 @@ IPG_TEMP_THRESHOLD_PAUSE       = 41       // °C — pause at/above
 IPG_TEMP_THRESHOLD_RESUME      = 39       // °C — resume at/below
 THERMAL_PAUSE_MIN_TICKS        = 15       // fault ticks (× 2 s) = 30 s dwell
 THERM_OUT_WRAP_MAX_MV          = 1040     // mV — THERM_OUT at/below this is a wrapped byte, rejected
+THERMAL_BLIND_RETRY_BASE_TICKS = 15       // fault ticks (× 2 s) = 30 s; doubles per failed retry
+THERMAL_BLIND_RETRY_MAX        = 4        // failed blind retries before the session ends
+THERMAL_PROBE_TIMEOUT_TICKS    = 10       // fault ticks (× 2 s) = 20 s for a retry to see an advertisement
 
 // OVP
 OVP_PAUSE_MIN_TICKS            = 5        // fault ticks (× 2 s) = 10 s dwell
@@ -1166,6 +1229,12 @@ LEVEL_INVALID                  = 0xFF     // sentinel: no bound observed yet
 LEVEL_REQUEST_MAX              = 0xFE     // out of range on purpose; HAL clamps
 PGOOD_LOW_CONFIRM              = 2        // consecutive PGOOD=0 cycles before stepping up
 BLANK_CYCLES_AFTER_FAULT       = 1        // control cycles skipped after a fault resume
+```
+
+**`app_state_machine.cpp`** (local to `ProcessNewBleData()`):
+```cpp
+BATTERY_FULL_MV            = 4100      // mV — a present battery must reach this to count as full
+BATTERY_PRESENT_MV         = 1000      // mV — a channel below this has no battery
 ```
 
 **`hal_wpt.h`:**
@@ -1193,7 +1262,7 @@ WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idl
 
 - **CTD control path is asserted but never used:** See §2.1. `WPT_CTD_CTRL` (P0.05) is driven HIGH at initialization and never changed, holding LTC4125 `CTD` at GND for the whole session. `StopSearch()` and `ResumeSearch()`, the functions meant to control it, are empty stubs — so `StopWptScan()` (reached via `WPT_STOP_SCAN`) does nothing. Needs a datasheet check and a scope on pin 14 to determine whether the current static state is correct.
 
-- **The WPT status path is inert:** `Wpt_LTC4125::GetStat()` unconditionally returns 0 (`hal_wpt.cpp:206-213`, TODO HSD-285 tracks the IC response investigation). Consequently `StatusTimeoutMonitoring` can never fire `WPT_SCAN_TIMEOUT`, the `WPT_SCAN_TIMEOUT → StateWait` transitions documented in §4.5 and §4.6 are unreachable, and the 500 ms `mStatusTimer` produces log output only. The WPT-side timeout safety net does not currently exist. If it is ever made live it becomes a silent coil kill in debug-build manual mode — `EnableWpt()` arms the 5 s timer and `StateCharging` answers `WPT_SCAN_TIMEOUT` with `WPT_POWER_OFF` — so revisit that path if HSD-285 is resolved.
+- **The WPT status path is inert:** `Wpt_LTC4125::GetStat()` unconditionally returns 0 (`hal_wpt.cpp:206-213`, TODO HSD-285 tracks the IC response investigation). Consequently `StatusTimeoutMonitoring` can never fire `WPT_SCAN_TIMEOUT`, the `WPT_SCAN_TIMEOUT → StateWait` transitions documented in §4.5 and §4.6 are unreachable, and the 500 ms `mStatusTimer` produces log output only. The WPT-side timeout safety net does not currently exist. (Since 2026-09-17 the thermal blind-retry give-up sends `WPT_SCAN_TIMEOUT` directly, so the `StateCharge` transition is now live on that path.) If it is ever made live it becomes a silent coil kill in debug-build manual mode — `EnableWpt()` arms the 5 s timer and `StateCharging` answers `WPT_SCAN_TIMEOUT` with `WPT_POWER_OFF` — so revisit that path if HSD-285 is resolved.
 
 - **`TURN_OFF` is unsent in production builds:** Nothing outside the debug console sends it, so the `state_charge.cpp:60` handler is unreachable in a production build. It is no longer safe to delete — debug builds use it to leave `StateManual` (§4.7).
 
@@ -1211,5 +1280,9 @@ WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idl
 
 - **VCC_EN stays high after leaving `StateCharge`:** `StateCharge::Exit()` sends no `PMC_POWER_OFF` (§4.6), so after a completed charge or a button press the LTC4125 remains powered, though disabled, in `StateWait`.
 
+
+- **Pause during coil-powered charging is blind:** While a drained IPG is paused it cannot report temperature; the blind retry (§6.5) bounds the exposure but still re-enables the coil without a fresh reading. A keep-alive power level (§8.8) would remove the blind period if bench data shows it is thermally safe.
+
+- **Completion thresholds assume the current IPG:** `BATTERY_PRESENT_MV` / `BATTERY_FULL_MV` (§7) rely on the IPG's 100 mV battery encoding and the LTC4065's 4.2 V float. An IPG firmware that stops sending battery voltages (both channels < 1 V) would never end a session on its own.
 
 - **`WptManager::RearmPowerSearch()` has no callers** (§6.2) — kept deliberately, but dead code today.
