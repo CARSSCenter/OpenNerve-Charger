@@ -12,12 +12,14 @@
 #include "eda_manager_log_config.h"
 #include "hal_dac.h"
 #include "svc_ble_subsystem.h"
+#include "svc_debug_console.h"
 
 namespace svc
 {
     uint8_t static m_max_power_level;
 
     uint8_t WptManager::m_pause_reasons = 0;
+    bool WptManager::m_coil_enabled = false;
     uint16_t WptManager::m_thermal_pause_ticks = 0;
     uint16_t WptManager::m_ovp_pause_ticks = 0;
 
@@ -29,6 +31,20 @@ namespace svc
     uint8_t WptManager::m_pgood_low_count = 0;
     uint32_t WptManager::m_last_adv_count = 0;
     bool WptManager::m_loop_initialized = false;
+    uint32_t WptManager::m_cold_start_adv_count = 0;
+    uint32_t WptManager::m_ovp_last_adv_count = 0;
+    bool WptManager::m_chg1_ovp_logged = false;
+    bool WptManager::m_chg2_ovp_logged = false;
+    uint32_t WptManager::m_thermal_pause_adv_count = 0;
+    uint32_t WptManager::m_ovp_pause_adv_count = 0;
+    bool WptManager::m_thermal_probe_active = false;
+    uint32_t WptManager::m_thermal_probe_adv_count = 0;
+    uint16_t WptManager::m_thermal_probe_ticks = 0;
+    uint8_t WptManager::m_thermal_retry_count = 0;
+    uint8_t WptManager::m_thermal_trip_level = WptManager::LEVEL_INVALID;
+    bool WptManager::m_thermal_probe_no_ad = false;
+    uint8_t WptManager::m_level_max_this_tick = WptManager::COLD_START_LEVEL;
+    uint8_t WptManager::m_level_max_last_tick = WptManager::COLD_START_LEVEL;
 
     WptManager &WptManager::Instance()
     {
@@ -48,7 +64,7 @@ namespace svc
 
     eda::Timer WptManager::mPowerCtrlTimer("WptPowerCtrl", POWER_CTRL_PERIOD_MS, 1, PowerControlMonitoring);
 
-    eda::Timer WptManager::mColdStartEscalateTimer("WptColdStart", COLD_START_ESCALATE_MS, 0, ColdStartEscalate);
+    eda::Timer WptManager::mColdStartRampTimer("WptColdStart", COLD_START_STEP_MS, 1, ColdStartRampStep);
 
     void WptManager::Init()
     {
@@ -115,7 +131,12 @@ namespace svc
         }
         else
         {
+            // Apply the recorded level first. DisableWpt() leaves the DAC where the
+            // last session put it, so enabling without this would briefly drive the
+            // coil at that level instead of m_level.
+            AdjustWptPowerTransfer(m_level);
             WptHalInstance.Enable();
+            m_coil_enabled = true;
         }
 
         StartStatusTimeoutTimer();
@@ -126,9 +147,10 @@ namespace svc
     void WptManager::DisableWpt()
     {
         WptHalInstance.Disable();
+        m_coil_enabled = false;
         StopStatusMonitoring();
         StopIpgTemperaturePgoodMonitoringTimer();
-        mColdStartEscalateTimer.Stop();
+        mColdStartRampTimer.Stop();
         ResetPowerControl();
         LOG_DEBUG("WPT Manager: DisableWpt\n");
     }
@@ -145,6 +167,7 @@ namespace svc
         if (was_running)
         {
             WptHalInstance.Disable();
+            m_coil_enabled = false;
         }
 
         // Deliberately does not touch mFaultTimer or mPowerCtrlTimer: monitoring has
@@ -161,6 +184,7 @@ namespace svc
         if (m_pause_reasons == 0)
         {
             WptHalInstance.Enable();
+            m_coil_enabled = true;
             LOG_INFO("WPT Manager: ResumeWpt reason 0x%02X cleared, coil re-enabled at level %d\n",
                      reason, m_level);
         }
@@ -240,9 +264,33 @@ namespace svc
         // Fault sampling and power control run at different rates but share a
         // lifetime, so callers still start and stop them as one unit.
         LOG_DEBUG("WPT Manager: StartIpgTemperatureMonitoringTimer\n");
+        // The IPG has been found, so the closed loop takes the level from here.
+        mColdStartRampTimer.Stop();
         mFaultTimer.Start();
         mPowerCtrlTimer.Start();
     }
+
+    void WptManager::StartFaultMonitoringOnly()
+    {
+        // Fault sampling without the power search. The manual bench state needs the
+        // thermal and OVP thresholds evaluated and logged, but nothing may move the
+        // level out from under the operator.
+        LOG_INFO("WPT Manager: Fault monitoring only (power control timer not started)\n");
+        mFaultTimer.Start();
+    }
+
+#if WPT_MANUAL_DEBUG_MODE
+    void WptManager::EnterManualIdle()
+    {
+        // DisableWpt() posts the cold-start ramp timer's stop before it calls
+        // ResetPowerControl(). The timer task outranks this one, so a ramp step
+        // that had already expired runs before the reset rather than after it,
+        // and the level still ends at COLD_START_LEVEL.
+        DisableWpt();
+        StartFaultMonitoringOnly();
+        LOG_WARNING("WPT Manager: Manual idle - coil off, level %d, fault monitoring only\n", m_level);
+    }
+#endif
 
     void WptManager::StopIpgTemperaturePgoodMonitoringTimer()
     {
@@ -251,27 +299,84 @@ namespace svc
         mPowerCtrlTimer.Stop();
     }
 
-    void WptManager::StartColdStartEscalation()
+    void WptManager::StartColdStartRamp()
     {
-        LOG_INFO("WPT Manager: Cold start at level %d, escalating to max in %d ms if no IPG advertisement\n",
-                 COLD_START_LEVEL, COLD_START_ESCALATE_MS);
+        m_cold_start_adv_count = svc::BleManager::GetAdvertisementCount();
+        LOG_INFO("WPT Manager: Cold start at level %d, stepping up every %d ms until an IPG advertisement\n",
+                 COLD_START_LEVEL, COLD_START_STEP_MS);
         SetPowerLevel(COLD_START_LEVEL);
-        mColdStartEscalateTimer.Start();
+        mColdStartRampTimer.Start();
     }
 
-    void WptManager::ColdStartEscalate(TimerHandle_t xTimer)
+    void WptManager::ColdStartRampStep(TimerHandle_t xTimer)
     {
-        // Self-guarding: if an advertisement arrived while this timer was pending,
-        // the closed loop now owns the power level and must not be overridden.
-        // That removes any need to cancel this timer on the BLE-found path.
-        if (svc::BleManager::GetAdvertisementCount() != 0)
+        // Self-guarding: if an advertisement arrived since the ramp started, the
+        // closed loop now owns the power level and must not be overridden.
+        if (svc::BleManager::GetAdvertisementCount() != m_cold_start_adv_count)
         {
-            LOG_INFO("WPT Manager: Cold start escalation skipped, IPG already advertising\n");
+            mColdStartRampTimer.Stop();
+            LOG_INFO("WPT Manager: Cold start ramp ended at level %d, IPG advertising\n", m_level);
             return;
         }
 
-        LOG_WARNING("WPT Manager: Cold start escalating to maximum power, still no IPG advertisement\n");
-        SetPowerLevel(LEVEL_REQUEST_MAX);
+        if (m_pause_reasons != 0)
+        {
+            LOG_WARNING("WPT Manager: Cold start ramp step skipped, fault mask 0x%02X owns the level\n",
+                        m_pause_reasons);
+            return;
+        }
+
+        if (m_level >= m_max_power_level)
+        {
+            mColdStartRampTimer.Stop();
+            LOG_WARNING("WPT Manager: Cold start ramp holding at maximum level %d, still no IPG advertisement\n",
+                        m_level);
+            return;
+        }
+
+        SetPowerLevel(m_level + 1);
+        LOG_WARNING("WPT Manager: Cold start ramp stepping up to level %d, no IPG advertisement yet (next step in %d ms)\n",
+                    m_level, COLD_START_STEP_MS);
+    }
+
+    bool WptManager::IsThermReadingPlausible(uint16_t get_therm_ref,
+                                             uint16_t get_therm_out,
+                                             uint16_t get_therm_ofst)
+    {
+        // The IPG packs each value as (mV / 10) into one byte. REF is clamped at
+        // 255 (2550 mV) but OUT and OFST are not, so an OUT of 2560 mV or more
+        // wraps - what BLE viewers show as "n/a". The IPG's ADC cannot read above
+        // 3.6 V, so a wrapped OUT always decodes to 0..THERM_OUT_WRAP_MAX_MV, and
+        // the floor below rejects every wrap whatever OFST happens to be.
+
+        // Zero: a wrapped byte, or the IPG's thermistor circuit unpowered.
+        if (get_therm_ref == 0 || get_therm_out == 0 || get_therm_ofst == 0)
+        {
+            return false;
+        }
+
+        // Wrapped OUT. A genuine OUT this low would need the thermistor below
+        // ~9 kOhm (~90 C at the design OFST of ~0.8 V) - unreachable without
+        // first passing through the 41 C trip on an earlier reading.
+        if (get_therm_out <= THERM_OUT_WRAP_MAX_MV)
+        {
+            return false;
+        }
+
+        // No voltage across the thermistor.
+        if (get_therm_out <= get_therm_ofst)
+        {
+            return false;
+        }
+
+        // No current through the 49.9 kOhm sense resistor. Also catches OUT at
+        // 2550-2559 mV, which encodes as 255 - the same byte as the clamped REF.
+        if (get_therm_out >= get_therm_ref)
+        {
+            return false;
+        }
+
+        return true;
     }
 
     float WptManager::CalculateTemperatureFromBle(uint16_t get_therm_ref,
@@ -292,7 +397,7 @@ namespace svc
         // Calculate thermistor resistance
         float resistance = voltage / current; // in kΩ
 
-        LOG_INFO("WPT Manager: IPG thermal resistance: %d", resistance);
+        LOG_INFO("WPT Manager: IPG thermistor resistance: %d", (int32_t)resistance);
 
         // Handle out of range values first
         if (resistance >= TEMP_LOOKUP_TABLE[0].resistance)
@@ -327,18 +432,91 @@ namespace svc
         return TEMP_LOOKUP_TABLE[LOOKUP_TABLE_SIZE - 1].temp; // Return a safe default
     }
 
+    void WptManager::FailThermalProbe(bool no_ad)
+    {
+        const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
+
+        m_thermal_probe_active = false;
+        m_thermal_retry_count++;
+        m_thermal_probe_no_ad = no_ad;
+        m_thermal_pause_ticks = 0;
+        m_thermal_pause_adv_count = adv_count;
+
+        LOG_WARNING("WPT Manager: Blind thermal retry %d/%d failed (%s) at level %d, pausing again\n",
+                    m_thermal_retry_count, THERMAL_BLIND_RETRY_MAX,
+                    no_ad ? "no advertisement" : "still hot", m_level);
+
+        WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
+                                  static_cast<uint32_t>(PAUSE_THERMAL));
+
+        // No advertisement: the level was too low to boot the IPG. Queue one step
+        // up for the next attempt, never above the level that tripped.
+        if (no_ad && (m_thermal_trip_level != LEVEL_INVALID) && (m_level < m_thermal_trip_level))
+        {
+            SetPowerLevel(m_level + 1);
+        }
+    }
+
     void WptManager::IpgTemperatureMonitoring(void)
     {
         // With no advertisement parsed yet the thermistor fields are all zero, which
         // makes the resistance calculation degenerate and falls through to the
         // table's top entry (50 C) - an instant spurious thermal pause.
-        if (svc::BleManager::GetAdvertisementCount() == 0)
+        const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
+        if (adv_count == 0)
         {
             return;
         }
 
         const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
         svc::ChargingStatusParameters_t ChargingStatusParameters = advData.chargingStatusParameters;
+
+        const bool thermally_paused = (m_pause_reasons & PAUSE_THERMAL) != 0;
+
+        // The dwell measures time, not readings, so it keeps counting through
+        // implausible samples below.
+        if (thermally_paused)
+        {
+            m_thermal_pause_ticks++;
+        }
+
+        // A blind retry is running: the stored reading is the stale one that caused
+        // the pause, so it must not be acted on. Wait for a fresh advertisement.
+        if (m_thermal_probe_active && !thermally_paused)
+        {
+            m_thermal_probe_ticks++;
+
+            if (adv_count == m_thermal_probe_adv_count)
+            {
+                if (m_thermal_probe_ticks >= THERMAL_PROBE_TIMEOUT_TICKS)
+                {
+                    FailThermalProbe(true);
+                }
+                return;
+            }
+        }
+
+        // An implausible reading carries no temperature at all, so it can neither
+        // pause nor resume: whatever state we are in is held until a real reading
+        // arrives. Without this, a wrapped OUT byte computes as a negative
+        // resistance, maps to the table's hot end (50 C) and pauses on its own.
+        if (!IsThermReadingPlausible(ChargingStatusParameters.GET_THERM_REF,
+                                     ChargingStatusParameters.GET_THERM_OUT,
+                                     ChargingStatusParameters.GET_THERM_OFST))
+        {
+            LOG_WARNING("WPT Manager: IPG thermistor reading implausible (ref=%d out=%d ofst=%d mV), ignored - no thermal decision this tick\n",
+                        ChargingStatusParameters.GET_THERM_REF,
+                        ChargingStatusParameters.GET_THERM_OUT,
+                        ChargingStatusParameters.GET_THERM_OFST);
+
+            // A probe keeps waiting for the next fresh advertisement, still bounded
+            // by its timeout.
+            if (m_thermal_probe_active)
+            {
+                m_thermal_probe_adv_count = adv_count;
+            }
+            return;
+        }
 
         float ipg_temperature = CalculateTemperatureFromBle(ChargingStatusParameters.GET_THERM_REF, ChargingStatusParameters.GET_THERM_OUT, ChargingStatusParameters.GET_THERM_OFST);
 
@@ -350,17 +528,57 @@ namespace svc
            ChargingStatusParameters.GET_THERM_OUT,
            ChargingStatusParameters.GET_THERM_OFST);
 
-        const bool thermally_paused = (m_pause_reasons & PAUSE_THERMAL) != 0;
+        if (m_thermal_probe_active && !thermally_paused)
+        {
+            // First fresh reading after a blind retry. The retry skipped the
+            // cool-down check, so this reading has to pass the resume threshold.
+            m_thermal_probe_active = false;
+
+            if (ipg_temperature > IPG_TEMP_THRESHOLD_RESUME)
+            {
+                FailThermalProbe(false);
+                return;
+            }
+
+            LOG_INFO("WPT Manager: Blind thermal retry confirmed, IPG %d.%02d C at/below %d C, continuing at level %d\n",
+                     (int32_t)ipg_temperature,
+                     (int32_t)((ipg_temperature) * 100) % 100,
+                     IPG_TEMP_THRESHOLD_RESUME,
+                     m_level);
+            m_thermal_retry_count = 0;
+            m_thermal_probe_no_ad = false;
+            return;
+        }
 
         if (!thermally_paused)
         {
             if (ipg_temperature >= IPG_TEMP_THRESHOLD_PAUSE)
             {
+#if WPT_MANUAL_DEBUG_MODE
+                // Warn only: the threshold is still evaluated and reported, but the
+                // coil is left exactly where the operator put it. The IPG's own
+                // 42 C gate is unaffected and still applies.
+                if (DebugConsole::IsManual())
+                {
+                    LOG_WARNING("[MANUAL] WARN thermal: IPG %d.%02d C >= %d C pause threshold (ignored)\n",
+                                (int32_t)ipg_temperature,
+                                (int32_t)((ipg_temperature) * 100) % 100,
+                                IPG_TEMP_THRESHOLD_PAUSE);
+                    return;
+                }
+#endif
+
                 LOG_ERROR("WPT Manager: IPG temperature %d.%02d C reached pause threshold (%d C), pausing power transfer",
                           (int32_t)ipg_temperature,
                           (int32_t)((ipg_temperature) * 100) % 100,
                           IPG_TEMP_THRESHOLD_PAUSE);
                 m_thermal_pause_ticks = 0;
+                m_thermal_pause_adv_count = adv_count;
+                m_thermal_probe_no_ad = false;
+                if (m_thermal_trip_level == LEVEL_INVALID)
+                {
+                    m_thermal_trip_level = m_level;
+                }
                 WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
                                           static_cast<uint32_t>(PAUSE_THERMAL));
             }
@@ -370,9 +588,8 @@ namespace svc
         // Held in a thermal pause. Resume needs both a minimum dwell and a genuine
         // recovery below the lower hysteresis threshold - the dwell alone would let
         // us re-enable into an implant that is still at the limit, producing a
-        // power burst cycle instead of a controlled hold.
-        m_thermal_pause_ticks++;
-
+        // power burst cycle instead of a controlled hold. (The dwell counter was
+        // advanced at the top, before the plausibility check.)
         if (m_thermal_pause_ticks < THERMAL_PAUSE_MIN_TICKS)
         {
             return;
@@ -380,6 +597,49 @@ namespace svc
 
         if (ipg_temperature > IPG_TEMP_THRESHOLD_RESUME)
         {
+            // No advertisement since the pause began: the IPG runs on coil power
+            // and went dark with the coil, so this reading can never improve.
+            if (adv_count != m_thermal_pause_adv_count)
+            {
+                return;
+            }
+
+            if (m_thermal_retry_count >= THERMAL_BLIND_RETRY_MAX)
+            {
+                LOG_ERROR("WPT Manager: IPG silent after %d blind thermal retries, ending charge session",
+                          m_thermal_retry_count);
+                // Same path as a lost receiver: StateCharge -> StateWait, coil off.
+                // The count is left at the limit so no retry can start before
+                // DisableWpt() resets it.
+                WptPort::SendEventFromISR(WptPort::Event_e::WPT_SCAN_TIMEOUT, NULL);
+                return;
+            }
+
+            if (m_thermal_pause_ticks < (THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count))
+            {
+                return;
+            }
+
+            // A thermal trip means the level delivered too much power, so retry one
+            // step lower - unless the last retry already showed that level was too
+            // low to boot the IPG and was raised for this attempt.
+            if (!m_thermal_probe_no_ad && (m_level > MIN_POWER_LEVEL))
+            {
+                SetPowerLevel(m_level - 1);
+            }
+
+            m_floor_found = false;
+            m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+
+            m_thermal_probe_active = true;
+            m_thermal_probe_adv_count = adv_count;
+            m_thermal_probe_ticks = 0;
+
+            LOG_WARNING("WPT Manager: IPG silent for %d ticks in thermal pause, blind retry %d/%d at level %d\n",
+                        m_thermal_pause_ticks, m_thermal_retry_count + 1, THERMAL_BLIND_RETRY_MAX, m_level);
+
+            WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
+                                      static_cast<uint32_t>(PAUSE_THERMAL));
             return;
         }
 
@@ -394,6 +654,8 @@ namespace svc
         // is the only event that reopens it once a floor has been found.
         m_floor_found = false;
         m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+        m_thermal_retry_count = 0;
+        m_thermal_probe_no_ad = false;
 
         WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
                                   static_cast<uint32_t>(PAUSE_THERMAL));
@@ -401,46 +663,107 @@ namespace svc
 
     void WptManager::IpgOvpMonitoring(void)
     {
+        // Rotate the fault-attribution window first, on every tick and before any
+        // early return, so it always spans exactly the current and previous tick.
+        const uint8_t fault_level = (m_level_max_this_tick > m_level_max_last_tick)
+                                        ? m_level_max_this_tick
+                                        : m_level_max_last_tick;
+        m_level_max_last_tick = m_level_max_this_tick;
+        m_level_max_this_tick = m_level;
+
+        const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
+
         // mAdvertisementData is zero-initialised and the IPG's fault bits are
         // active-low, so before the first advertisement every fault reads as
         // asserted. Without this guard the charger pauses for OVP at every startup.
-        if (svc::BleManager::GetAdvertisementCount() == 0)
+        if (adv_count == 0)
         {
             return;
         }
 
+        // Only a new advertisement can report a new fault. Re-reading the same one
+        // on the next tick would charge an old fault to whatever level is in force
+        // by then - and after scanning stops, to every level for the rest of the
+        // session.
+        const bool fresh = (adv_count != m_ovp_last_adv_count);
+        m_ovp_last_adv_count = adv_count;
+
         const svc::AdvertisementData_t &advData = svc::BleManager::GetAdvertisementData();
         const svc::ChargingStatusParameters_t &p = advData.chargingStatusParameters;
 
-        // Raw active-low bits straight from the IPG MSD GPIO byte: 0 = asserted.
-        // CHG1 is excluded deliberately - CHG1_STATUS reads 1 in every state
-        // observed on this hardware and CHG2 is the battery actually being charged,
-        // so gating on CHG1_OVP_ERR would add noise without signal. Logged only.
+        // Raw active-low bits straight from the IPG MSD GPIO byte: 1 = OK,
+        // 0 = asserted. The IPG packs the pin level unmodified
+        // (setBitFromGpioState in app_mode_ble_active.c), so these compares are
+        // the only inversion anywhere between the IPG pin and this decision.
+        //
+        // Only VRECT_OVPn acts. It is a FET threshold on VRECT/17 - the rectifier
+        // voltage the coil produces - and so the only fault that coil power causes
+        // and that reducing coil power can clear.
+        //
+        // CHGx_OVP_ERRn are logged and nothing more. Each is a battery-node
+        // comparator (VBATxCHG >= 4.277 V) that disconnects its battery in hardware
+        // by itself, and the IPG additionally pauses its own converter on it. The
+        // LTC4065 holds its float voltage regardless of input power, so no PTH
+        // level can clear a genuine battery OVP; and the comparator runs from
+        // VCHG_RAIL, so its output is not guaranteed while that rail is collapsed
+        // (PGOOD = 0) - pausing on it caused spurious pauses at low power. If the
+        // IPG's converter shutdown leaves the coil with nowhere to put its energy,
+        // VRECT rises and VRECT_OVPn brings the charger in through the path above.
         const bool vrect_ovp = (p.GET_VRECT_OVP == 0);
+        const bool chg1_ovp = (p.GET_CHG1_OVP_ERR == 0);
         const bool chg2_ovp = (p.GET_CHG2_OVP_ERR == 0);
-        const bool ovp_active = vrect_ovp || chg2_ovp;
+
+        if (fresh && ((chg1_ovp != m_chg1_ovp_logged) || (chg2_ovp != m_chg2_ovp_logged)))
+        {
+            // Logged on change only - these never alter the coil, so a line per
+            // advertisement would be noise. PGOOD is included because a flag that
+            // asserts only while PGOOD = 0 points at the VCHG_RAIL collapse rather
+            // than a real battery over-voltage.
+            if (chg1_ovp || chg2_ovp)
+            {
+                LOG_WARNING("WPT Manager: IPG battery OVP flag asserted (CHG1_OVP_ERRn=%d CHG2_OVP_ERRn=%d, 0 = fault) at level %d, PGOOD=%d - logged only, coil unaffected\n",
+                            p.GET_CHG1_OVP_ERR, p.GET_CHG2_OVP_ERR, m_level,
+                            p.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD);
+            }
+            else
+            {
+                LOG_INFO("WPT Manager: IPG battery OVP flags cleared (CHG1_OVP_ERRn=%d CHG2_OVP_ERRn=%d) at level %d, PGOOD=%d\n",
+                         p.GET_CHG1_OVP_ERR, p.GET_CHG2_OVP_ERR, m_level,
+                         p.GET_VCHG_RAIL_SUPPLY_CIRCUIT_POWER_GOOD);
+            }
+
+            m_chg1_ovp_logged = chg1_ovp;
+            m_chg2_ovp_logged = chg2_ovp;
+        }
 
         const bool ovp_paused = (m_pause_reasons & PAUSE_OVP) != 0;
 
         if (!ovp_paused)
         {
-            if (!ovp_active)
+            if (!fresh || !vrect_ovp)
             {
                 return;
             }
 
-            // Remember the lowest level that has ever faulted. Without this the
-            // "PGOOD is low, add power" rule walks straight back into the level we
-            // just tripped on, and the two controllers oscillate indefinitely.
-            if (m_ovp_ceiling == LEVEL_INVALID || m_level < m_ovp_ceiling)
-            {
-                m_ovp_ceiling = m_level;
-            }
+            RecordOvpCeiling(fault_level);
 
-            LOG_ERROR("WPT Manager: IPG OVP asserted at level %d (vrect=%d chg2=%d chg1=%d), ceiling now %d, pausing",
-                      m_level, vrect_ovp, chg2_ovp, (p.GET_CHG1_OVP_ERR == 0), m_ovp_ceiling);
+#if WPT_MANUAL_DEBUG_MODE
+            // Warn only. The ceiling above is still recorded, so a later return to
+            // automatic mode still knows which level faulted, but nothing pauses
+            // the coil and nothing steps the level down.
+            if (DebugConsole::IsManual())
+            {
+                LOG_WARNING("[MANUAL] WARN ovp: VRECT_OVPn=0 at level %d, charged to %d, ceiling %d, ignored\n",
+                            m_level, fault_level, m_ovp_ceiling);
+                return;
+            }
+#endif
+
+            LOG_ERROR("WPT Manager: IPG rectifier OVP (VRECT_OVPn=0) at level %d, charged to %d, ceiling %d, pausing",
+                      m_level, fault_level, m_ovp_ceiling);
 
             m_ovp_pause_ticks = 0;
+            m_ovp_pause_adv_count = adv_count;
             WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
                                       static_cast<uint32_t>(PAUSE_OVP));
             return;
@@ -453,9 +776,16 @@ namespace svc
             return;
         }
 
-        if (ovp_active)
+        if (adv_count == m_ovp_pause_adv_count)
         {
-            LOG_WARNING("WPT Manager: IPG OVP still asserted after %d ticks, staying paused\n", m_ovp_pause_ticks);
+            // No advertisement since the pause: a coil-powered IPG went dark with
+            // the coil, so the stored VRECT_OVPn is stale and can never clear.
+            LOG_WARNING("WPT Manager: IPG silent for %d ticks in OVP pause, treating fault as cleared\n",
+                        m_ovp_pause_ticks);
+        }
+        else if (vrect_ovp)
+        {
+            LOG_WARNING("WPT Manager: VRECT_OVPn still 0 after %d ticks, staying paused\n", m_ovp_pause_ticks);
             return;
         }
 
@@ -472,7 +802,7 @@ namespace svc
         // condition, which would undo the back-off - so skip a control cycle.
         m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
 
-        LOG_INFO("WPT Manager: IPG OVP cleared after %d ticks, resuming one step down at level %d\n",
+        LOG_INFO("WPT Manager: VRECT_OVPn cleared after %d ticks, resuming one step down at level %d\n",
                  m_ovp_pause_ticks, m_level);
 
         WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
@@ -483,6 +813,28 @@ namespace svc
     {
         LOG_DEBUG("WPT Manager: SetPulseWidthThresholdStep\n");
         WptHalInstance.SetPulseWidthThresholdStep(step);
+    }
+
+    uint8_t WptManager::GetMaxPowerLevel()
+    {
+        return m_max_power_level;
+    }
+
+    void WptManager::SetPowerLevelManual(uint8_t level)
+    {
+        SetPowerLevel(level);
+    }
+
+    void WptManager::RearmPowerSearch()
+    {
+        m_floor_found = false;
+        m_pgood_low_count = 0;
+
+        // Skip a cycle so the first automatic decision is made on telemetry that
+        // reflects the level actually in force, not one sampled mid-handover.
+        m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+
+        LOG_INFO("WPT Manager: Power search re-armed at level %d\n", m_level);
     }
 
     void WptManager::ResetPowerControl()
@@ -497,10 +849,39 @@ namespace svc
         m_pgood_floor = LEVEL_INVALID;
         m_blank_cycles = 0;
         m_pgood_low_count = 0;
-        m_last_adv_count = 0;
+        // The advertisement counter runs from boot, so a later session must compare
+        // against its current value: resetting to 0 would make the previous
+        // session's last advertisement look fresh.
+        m_last_adv_count = svc::BleManager::GetAdvertisementCount();
+        m_cold_start_adv_count = m_last_adv_count;
         m_loop_initialized = false;
+        // Forget the logged battery OVP state so a flag still asserted when the
+        // next session starts is reported again there.
+        m_chg1_ovp_logged = false;
+        m_chg2_ovp_logged = false;
+        m_level_max_this_tick = COLD_START_LEVEL;
+        m_level_max_last_tick = COLD_START_LEVEL;
+        m_thermal_pause_adv_count = 0;
+        m_ovp_pause_adv_count = 0;
+        m_thermal_probe_active = false;
+        m_thermal_probe_adv_count = 0;
+        m_thermal_probe_ticks = 0;
+        m_thermal_retry_count = 0;
+        m_thermal_trip_level = LEVEL_INVALID;
+        m_thermal_probe_no_ad = false;
 
         LOG_INFO("WPT Manager: Power control reset, level %d\n", m_level);
+    }
+
+    void WptManager::RecordOvpCeiling(uint8_t level)
+    {
+        // Remember the lowest level that has ever faulted. Without this the
+        // "PGOOD is low, add power" rule walks straight back into the level we
+        // just tripped on, and the two controllers oscillate indefinitely.
+        if (m_ovp_ceiling == LEVEL_INVALID || level < m_ovp_ceiling)
+        {
+            m_ovp_ceiling = level;
+        }
     }
 
     bool WptManager::IsPowerWindowEmpty()
@@ -541,8 +922,8 @@ namespace svc
         const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
 
         // No fresh telemetry since the last decision, so the last change has not
-        // been observed yet. Also covers cold start, where the count stays 0 and
-        // the open-loop escalation owns the level instead.
+        // been observed yet. Also covers cold start, where the count is unchanged
+        // and the open-loop ramp owns the level instead.
         if (adv_count == m_last_adv_count)
         {
             LOG_WARNING("WPT Manager: Power control skipped, no new IPG advertisement since last step\n");
@@ -551,13 +932,14 @@ namespace svc
 
         m_last_adv_count = adv_count;
 
-        // First cycle with real telemetry: take the level back to the mid-range
-        // start, wherever the open-loop cold-start attempt happened to leave it.
+        // First cycle with real telemetry: keep the level the cold-start ramp
+        // reached (jumping to a fixed mid-range level can damage the IPG's
+        // rectifier) and wait one cycle before the first decision. From here PGOOD
+        // moves the level one step at a time in either direction.
         if (!m_loop_initialized)
         {
             m_loop_initialized = true;
-            SetPowerLevel(COLD_START_LEVEL);
-            LOG_INFO("WPT Manager: Closed loop starting at level %d\n", m_level);
+            LOG_INFO("WPT Manager: Closed loop starting at level %d (cold-start level kept)\n", m_level);
             return;
         }
 
@@ -655,6 +1037,13 @@ namespace svc
 
         m_level = level;
 
+        // Feed the OVP attribution window (see m_level_max_this_tick). Only ever
+        // raised here; IpgOvpMonitoring() rotates it on every fault tick.
+        if (level > m_level_max_this_tick)
+        {
+            m_level_max_this_tick = level;
+        }
+
         WptPort::SendEventFromISR(WptPort::Event_e::WPT_ADJUST_POWER, static_cast<uint32_t>(level));
     }
 
@@ -668,6 +1057,16 @@ namespace svc
         IpgOvpMonitoring();
 
         IpgTemperatureMonitoring();
+
+#if WPT_MANUAL_DEBUG_MODE
+        // Attribution: with every charger-side cutoff disabled, this is the only
+        // way to tell an IPG that has shut itself down from a command that never
+        // took effect.
+        if (DebugConsole::IsManual())
+        {
+            DebugConsole::LogIpgBits();
+        }
+#endif
 
         LOG_FLUSH();
     }

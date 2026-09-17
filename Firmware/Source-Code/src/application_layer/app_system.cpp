@@ -14,6 +14,7 @@
 #include "eda_active_object_priorities.h"
 #include "eda_manager.h"
 #include "svc_ble_subsystem.h"
+#include "svc_debug_console.h"
 #include "svc_pmc_manager.h"
 #include "svc_wpt_manager.h"
 #include "svc_pmc_subsystem.h"
@@ -53,6 +54,11 @@ namespace app
         mSystemStateMachine.Init();
 
         mHeartbeatTimer.Start();
+
+        // Compiles to nothing unless WPT_MANUAL_DEBUG_MODE is set. Even when it is,
+        // the firmware keeps running its normal automatic control until the
+        // operator takes over from the RTT console.
+        svc::DebugConsole::Init();
 
         LOG_INFO("System Initialized - Version %d.%d.%d (%s)\n", VER_MAJOR, VER_MINOR, VER_REVISION, VER_ID);
     }

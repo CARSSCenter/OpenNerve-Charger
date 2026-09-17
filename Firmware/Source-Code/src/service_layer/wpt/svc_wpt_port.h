@@ -12,6 +12,7 @@
 
 #include "../../core_layer/event_driven_architecture/port/eda_port.h"
 #include "../../application_layer/app_port_list.h"
+#include "svc_debug_config.h"
 
 #include <cstdint>
 
@@ -41,7 +42,14 @@ namespace svc
             /** Suspend/restore coil output for a fault. optDataAddress carries the
              *  WptManager::PauseReason_e that is being set or cleared. */
             WPT_FAULT_PAUSE = 0x0F,
-            WPT_FAULT_RESUME = 0x10
+            WPT_FAULT_RESUME = 0x10,
+#if WPT_MANUAL_DEBUG_MODE
+            /// Debug builds only. Sent by StateManual::Entry() so that it is queued
+            /// behind anything the previous application state sent to this port;
+            /// every WPT state answers it by stopping the coil and settling in
+            /// StateIdle with fault monitoring only.
+            WPT_MANUAL_IDLE = 0x11
+#endif
         };
 
         WptPort();

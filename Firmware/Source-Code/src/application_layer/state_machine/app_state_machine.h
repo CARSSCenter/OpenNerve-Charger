@@ -17,6 +17,7 @@
 #include "state_wait.h"
 #include "state_slow_charge_and_scan.h"
 #include "state_initialization.h"
+#include "state_manual.h"
 #include "hal_button.h"
 
 namespace app
@@ -29,6 +30,9 @@ namespace app
         StateScan *pStateScan;
         StateWait *pStateWait;
         StateSlowChargeAndScan *pStateSlowChargeAndScan;
+#if WPT_MANUAL_DEBUG_MODE
+        StateManual *pStateManual;
+#endif
     };
 
     class SystemStateMachine : public eda::StateMachine
@@ -49,6 +53,9 @@ namespace app
         StateScan mStateScan;
         StateWait mStateWait;
         StateSlowChargeAndScan mStateSlowChargeAndScan;
+#if WPT_MANUAL_DEBUG_MODE
+        StateManual mStateManual;
+#endif
 
         /// Processes the new BLE data
         ///

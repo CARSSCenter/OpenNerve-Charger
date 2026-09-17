@@ -17,6 +17,7 @@
 #include "hal_wpt.h"
 #include "hal_dac.h"
 #include "eda_timer.h"
+#include "svc_debug_config.h"
 
 namespace svc
 {
@@ -49,7 +50,11 @@ namespace svc
         enum PauseReason_e : uint8_t
         {
             PAUSE_THERMAL = 1 << 0,
-            PAUSE_OVP = 1 << 1
+            PAUSE_OVP = 1 << 1,
+            /// Set only by the RTT debug console. Uses the same mask as the fault
+            /// reasons so a manual stop cannot be undone by an automatic resume,
+            /// and so the coil-enabled-iff-mask-is-zero rule keeps holding.
+            PAUSE_MANUAL = 1 << 2
         };
 
         /// Suspends coil output for a fault condition, without stopping fault or
@@ -91,16 +96,85 @@ namespace svc
         /// Starts the IPG temp and PGOOD status timer.
         void StartIpgTemperaturePgoodMonitoringTimer();
 
+        /// Starts fault monitoring (IPG temperature + OVP) WITHOUT the power
+        /// control timer.
+        ///
+        /// Used by the manual bench state: the fault monitor must run so the
+        /// thermal and OVP thresholds are still evaluated and reported, but the
+        /// titration loop must never move the operator's level. Not starting the
+        /// timer is what makes that structural rather than a runtime check.
+        /// StopIpgTemperaturePgoodMonitoringTimer() still stops both, so there is
+        /// no matching partial stop.
+        void StartFaultMonitoringOnly();
+
+#if WPT_MANUAL_DEBUG_MODE
+        /// Establishes manual mode's idle baseline: coil off, every WPT timer
+        /// stopped, any running cold-start ramp cancelled, power search reset,
+        /// then fault monitoring restarted on its own.
+        ///
+        /// Must run on the WPT task, dispatched from WPT_MANUAL_IDLE. The SYSTEM task
+        /// outranks the WPT task, so anything the previous application state queued
+        /// here is processed after StateManual::Entry(); only an event queued behind
+        /// those can be relied on to have the last word.
+        void EnterManualIdle();
+#endif
+
         /// Stops the IPG temp and PGOOD status timer.
         void StopIpgTemperaturePgoodMonitoringTimer();
 
-        /// Begins the open-loop cold-start attempt: drives COLD_START_LEVEL now and
-        /// escalates to maximum power after COLD_START_ESCALATE_MS if no IPG
-        /// advertisement has been seen by then.
-        void StartColdStartEscalation();
+        /// Begins the open-loop cold-start ramp: drives COLD_START_LEVEL now and
+        /// steps up one level every COLD_START_STEP_MS until an IPG advertisement
+        /// arrives or the maximum level is reached.
+        void StartColdStartRamp();
 
         /// Set Wpt power Transfer pulse width
         void AdjustWptPowerTransfer(uint8_t step);
+
+        /// Applies an absolute PTH step on behalf of the RTT debug console.
+        ///
+        /// Goes through the same path as the automatic loop so that m_level stays
+        /// the single source of truth for the current step - setting the DAC alone
+        /// would leave the recorded level stale and desynchronise the status dump
+        /// and any later automatic resume.
+        ///
+        /// @param level PTH step; clamped to the hardware maximum.
+        static void SetPowerLevelManual(uint8_t level);
+
+        /// Current PTH step.
+        static uint8_t GetPowerLevel() { return m_level; }
+
+        /// Highest PTH step the hardware accepts.
+        static uint8_t GetMaxPowerLevel();
+
+        /// Bitmask of PauseReason_e. Zero means the coil is enabled.
+        static uint8_t GetPauseReasons() { return m_pause_reasons; }
+
+        /// Lowest step observed to trip an IPG OVP fault, or LEVEL_INVALID.
+        static uint8_t GetOvpCeiling() { return m_ovp_ceiling; }
+
+        /// Highest step observed to be insufficient for PGOOD, or LEVEL_INVALID.
+        static uint8_t GetPgoodFloor() { return m_pgood_floor; }
+
+        /// True once the downward power search has settled.
+        static bool IsFloorFound() { return m_floor_found; }
+
+        /// True while the coil is actually being driven.
+        ///
+        /// Not the same as GetPauseReasons() == 0: with the WPT state machine in
+        /// StateIdle the mask is zero and the coil is off, which is exactly where
+        /// manual mode idles before 's' is pressed.
+        static bool IsCoilEnabled() { return m_coil_enabled; }
+
+        /// Re-opens the downward power search without discarding what has been
+        /// observed about the usable window.
+        ///
+        /// Needed when handing control back from the debug console: the level the
+        /// operator happened to stop on is not a floor the loop derived, but
+        /// m_floor_found may still be set from before. Leaving it set would make
+        /// the loop hold that level indefinitely instead of resuming its descent.
+        /// m_ovp_ceiling and m_pgood_floor are deliberately kept - those are real
+        /// observations of the hardware and stay valid.
+        static void RearmPowerSearch();
 
         int16_t mWptImonVoltage;
 
@@ -110,6 +184,12 @@ namespace svc
 
     private:
         static constexpr uint32_t k_resistor_value = 49900; // 49.9kΩ in ohms
+
+        // Largest value a wrapped THERM_OUT byte can decode to. The IPG packs OUT
+        // unclamped as (mV / 10) in one byte, so it wraps at 2560 mV, and its ADC
+        // cannot read above VREF+ <= 3.6 V (STM32 supply maximum):
+        // 3600 - 2560 = 1040 mV. See IsThermReadingPlausible().
+        static constexpr uint16_t THERM_OUT_WRAP_MAX_MV = 1040;
 
         // Temperature lookup table entry
         struct TempResistancePair
@@ -143,6 +223,19 @@ namespace svc
         // counted in FAULT_MONITOR_PERIOD_MS ticks. 15 * 2 s = 30 s.
         static constexpr uint16_t THERMAL_PAUSE_MIN_TICKS = 15;
 
+        // Blind thermal retry. Below ~3.2 V the IPG runs on rectified coil power, so
+        // a thermal pause switches it off and no fresh temperature can ever arrive to
+        // satisfy the resume threshold. When a pause sees no new advertisement, the
+        // coil is re-enabled one step lower after 30 s, 60 s, 120 s, 240 s (base <<
+        // failed retries) until the IPG reports again, and the session ends after
+        // THERMAL_BLIND_RETRY_MAX failures.
+        static constexpr uint16_t THERMAL_BLIND_RETRY_BASE_TICKS = 15; // 30 s
+        static constexpr uint8_t THERMAL_BLIND_RETRY_MAX = 4;
+
+        // How long a blind retry waits for a fresh advertisement before it counts as
+        // failed. 10 * 2 s = 20 s; a drained IPG advertised ~1 s after cold start.
+        static constexpr uint16_t THERMAL_PROBE_TIMEOUT_TICKS = 10;
+
         // Minimum time held in an OVP pause, in fault-monitor ticks. 5 * 2 s = 10 s.
         static constexpr uint16_t OVP_PAUSE_MIN_TICKS = 5;
 
@@ -152,10 +245,12 @@ namespace svc
         // Sentinel for "no bound observed yet". Not a reachable power level.
         static constexpr uint8_t LEVEL_INVALID = 0xFF;
 
-        // Where the closed loop starts once BLE telemetry is available, and where
-        // the open-loop cold-start attempt begins. Mid-range: high enough to wake a
-        // drained IPG, low enough not to drive VRECT straight into OVP.
-        static constexpr uint8_t COLD_START_LEVEL = 7;
+        // Level the coil is reset to and where the open-loop cold-start ramp
+        // begins. Kept low on purpose: jumping straight to a mid-range level (7)
+        // has occasionally damaged the IPG's rectifier, so power is brought up one
+        // step at a time instead. The closed loop starts from wherever the ramp
+        // stopped rather than from a fixed level.
+        static constexpr uint8_t COLD_START_LEVEL = 1;
 
         // Passed to SetPulseWidthThresholdStep() to request maximum power. Out of
         // range on purpose - the HAL clamps anything above the maximum step to
@@ -173,9 +268,11 @@ namespace svc
         // would drive us straight back into the fault.
         static constexpr uint8_t BLANK_CYCLES_AFTER_FAULT = 1;
 
-        // How long the cold-start attempt stays at COLD_START_LEVEL before
-        // escalating to maximum power for the rest of the scan window.
-        static constexpr uint32_t COLD_START_ESCALATE_MS = 5000;
+        // Time the cold-start ramp spends at each level before stepping up by one.
+        // SCAN_TIMEOUT_SLOW_CHARGE_MS (svc_ble_manager.h) is sized from this and
+        // COLD_START_LEVEL so the ramp can reach the maximum level and hold it for
+        // one step before the white-light window ends.
+        static constexpr uint32_t COLD_START_STEP_MS = 30000;
 
         /// Construct WptManager
         WptManager();
@@ -204,11 +301,12 @@ namespace svc
         /// @param xTimer Handle to the timer
         static void PowerControlMonitoring(TimerHandle_t xTimer);
 
-        /// Callback for the cold-start escalation timer: raises power to maximum
-        /// if no IPG advertisement has been seen yet.
+        /// Callback for the periodic cold-start ramp timer: raises power by one
+        /// level if no IPG advertisement has arrived since the ramp started, and
+        /// stops the timer once one has or the maximum level is reached.
         ///
         /// @param xTimer Handle to the timer
-        static void ColdStartEscalate(TimerHandle_t xTimer);
+        static void ColdStartRampStep(TimerHandle_t xTimer);
 
         /// This method configures the GPIOs.
         void ConfigureGpios();
@@ -222,6 +320,14 @@ namespace svc
         static float CalculateTemperatureFromBle(uint16_t get_therm_ref,
                                                  uint16_t get_therm_out,
                                                  uint16_t get_therm_ofst);
+
+        /// Rejects thermistor readings no real thermistor can produce - chiefly
+        /// the IPG's unclamped OUT byte wrapping to ~0 above 2.56 V ("n/a").
+        ///
+        /// @return true if the reading may be passed to CalculateTemperatureFromBle()
+        static bool IsThermReadingPlausible(uint16_t get_therm_ref,
+                                            uint16_t get_therm_out,
+                                            uint16_t get_therm_ofst);
 
         /// Evaluates the IPG temperature from BLE data and drives the thermal
         /// pause/resume hysteresis.
@@ -238,6 +344,10 @@ namespace svc
         /// floor, i.e. no power level can satisfy the IPG without faulting it.
         static bool IsPowerWindowEmpty();
 
+        /// Charges a rectifier OVP fault to a power level, keeping the lowest
+        /// level that has ever faulted as m_ovp_ceiling.
+        static void RecordOvpCeiling(uint8_t level);
+
         /// Applies a power level and records it as the current level.
         ///
         /// @param level The power level to set (MIN_POWER_LEVEL to maximum step)
@@ -251,7 +361,7 @@ namespace svc
 
         static eda::Timer mPowerCtrlTimer;
 
-        static eda::Timer mColdStartEscalateTimer;
+        static eda::Timer mColdStartRampTimer;
 
         hal::Dac80504 DacHalInstance;
 
@@ -259,6 +369,10 @@ namespace svc
 
         // Bitmask of PauseReason_e. Coil output is enabled only while this is zero.
         static uint8_t m_pause_reasons;
+
+        // Tracks the actual coil drive state, which the pause mask alone cannot
+        // express - see IsCoilEnabled().
+        static bool m_coil_enabled;
 
         // Time held in each pause, counted in fault-monitor ticks.
         static uint16_t m_thermal_pause_ticks;
@@ -287,9 +401,61 @@ namespace svc
         // cycle when no fresh IPG telemetry has arrived since the last decision.
         static uint32_t m_last_adv_count;
 
-        // False until the first control cycle with real BLE data, which forces the
-        // level to COLD_START_LEVEL regardless of where cold start left it.
+        // False until the first control cycle with real BLE data. That cycle keeps
+        // the level the cold-start ramp reached and only waits one cycle before the
+        // first decision - it never jumps the level.
         static bool m_loop_initialized;
+
+        // Advertisement counter when the cold-start ramp started. The counter runs
+        // from boot, so "no advertisement yet" means unchanged from this, not zero.
+        static uint32_t m_cold_start_adv_count;
+
+        // Advertisement counter when the current thermal / OVP pause started (or
+        // the last blind retry ended). Unchanged while paused = the IPG is dark.
+        static uint32_t m_thermal_pause_adv_count;
+        static uint32_t m_ovp_pause_adv_count;
+
+        // Blind thermal retry state. While a probe is active the stored (stale)
+        // temperature is ignored until a fresh advertisement arrives, and that first
+        // fresh reading must satisfy the resume threshold, not just the pause one.
+        static bool m_thermal_probe_active;
+        static uint32_t m_thermal_probe_adv_count;
+        static uint16_t m_thermal_probe_ticks;
+        static uint8_t m_thermal_retry_count;
+        // Level in force when the thermal pause first tripped; retries never exceed it.
+        static uint8_t m_thermal_trip_level;
+        // True when the last retry failed for lack of an advertisement, meaning the
+        // level was already raised for the next attempt and must not be stepped down.
+        static bool m_thermal_probe_no_ad;
+
+        /// Ends a blind thermal retry that failed and re-pauses the coil.
+        ///
+        /// @param no_ad true if the IPG never advertised (level too low to boot it)
+        static void FailThermalProbe(bool no_ad);
+
+        // Advertisement counter seen at the last OVP evaluation; a fault is acted
+        // on only when it arrives in a new advertisement. Deliberately not reset by
+        // ResetPowerControl(): the counter only grows, and keeping it means the
+        // last advertisement of a previous session is never mistaken for fresh.
+        static uint32_t m_ovp_last_adv_count;
+
+        // Last CHG1/CHG2_OVP_ERRn state that was logged (true = asserted). The
+        // battery OVP flags are log-only, so they are reported on change rather
+        // than on every advertisement.
+        static bool m_chg1_ovp_logged;
+        static bool m_chg2_ovp_logged;
+
+        // Highest level applied during the current and the previous fault tick.
+        // IPG telemetry lags the level by up to ~3 s (1 s IPG sampling plus the 2 s
+        // fault tick), so a rectifier fault is charged to the highest level applied
+        // over that window, not to whatever level is in force when it is read.
+        // Otherwise a step down taken just before the fault is read - by the power
+        // loop, the cold-start handover or a manual '-' - pins the ceiling on a
+        // level that never faulted. Erring high is self-correcting (the level just
+        // below re-trips and lowers the ceiling); erring low is not, because the
+        // ceiling never rises again within a session.
+        static uint8_t m_level_max_this_tick;
+        static uint8_t m_level_max_last_tick;
     };
 }
 

@@ -20,7 +20,10 @@
 
 #define TIMER_NAME "BleTimeoutTimer"
 #define SCAN_TIMEOUT_MS 10000            // Blue-light (StateScan) and StateCharge timeout
-#define SCAN_TIMEOUT_SLOW_CHARGE_MS 10000 // White-light (StateSlowChargeAndScan) timeout
+// White-light (StateSlowChargeAndScan) timeout. Sized for the WPT cold-start ramp
+// (svc_wpt_manager.h): COLD_START_STEP_MS (30 s) per level from COLD_START_LEVEL (1)
+// up to the maximum (12) = 12 steps, plus one step held at the maximum. Keep in sync.
+#define SCAN_TIMEOUT_SLOW_CHARGE_MS 390000
 #define PERIODIC 1
 #define ONESHOT 0
 

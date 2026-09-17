@@ -85,11 +85,11 @@ namespace svc
         case WptPort::Event_e::WPT_SLOW_CHARGE:
         {
             // Cold start: no IPG advertisement yet, so there is no PGOOD or OVP to
-            // steer by. Drive a mid-range PTH now and escalate to maximum partway
-            // through the scan window if nothing has answered - minimum power was
-            // never enough to bring a drained IPG's VRECT up to boot.
-            LOG_DEBUG("WPT State Machine Charging state: WPT Slow Charge - cold start power\n");
-            mWptManager.StartColdStartEscalation();
+            // steer by. Start at a low PTH and step up one level every 30 s until
+            // the IPG answers - a direct jump to mid-range power has occasionally
+            // damaged the IPG's rectifier.
+            LOG_DEBUG("WPT State Machine Charging state: WPT Slow Charge - cold start ramp\n");
+            mWptManager.StartColdStartRamp();
             break;
         }
         case WptPort::Event_e::WPT_BATTERY_CHARGED:
@@ -131,6 +131,17 @@ namespace svc
             mWptManager.ResumeWpt(static_cast<uint8_t>(optDataAddress));
             break;
         }
+#if WPT_MANUAL_DEBUG_MODE
+        case WptPort::Event_e::WPT_MANUAL_IDLE:
+        {
+            // Queued by StateManual::Entry() behind anything the previous
+            // application state sent, so this is the last word: coil off, timers
+            // stopped, back to idle until the operator's 's'.
+            mWptManager.EnterManualIdle();
+            stateMachine->ChangeState(states->pStateIdle);
+            break;
+        }
+#endif
         default:
         {
             break;

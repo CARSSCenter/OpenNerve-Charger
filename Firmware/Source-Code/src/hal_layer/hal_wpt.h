@@ -60,6 +60,20 @@ namespace hal
 
         uint8_t GetMaxPulseWidthThresholdStep(void);
 
+        /// Millivolts the DAC is driven to for a given PTH step, using the same
+        /// mapping SetPulseWidthThresholdStep() applies. Exposed so callers can
+        /// report a step in volts without duplicating the constants.
+        ///
+        /// @param step PTH step; anything above the maximum reports the maximum,
+        ///             matching the clamp in SetPulseWidthThresholdStep().
+        static constexpr uint16_t StepToMillivolts(uint8_t step)
+        {
+            return (step > MAX_VOLTAGE_STEP_PULSE_WIDTH)
+                       ? VoltageMaxPulseWidthThreshold_mV
+                       : static_cast<uint16_t>(VoltageMinPulseWidthThreshold_mV +
+                                               (step * VoltageStepPulseWidthThreshold_mV));
+        }
+
     private:
         Dac80504 mDac;
 
