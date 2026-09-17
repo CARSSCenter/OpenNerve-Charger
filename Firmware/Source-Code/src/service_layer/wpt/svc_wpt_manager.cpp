@@ -34,6 +34,14 @@ namespace svc
     uint32_t WptManager::m_ovp_last_adv_count = 0;
     bool WptManager::m_chg1_ovp_logged = false;
     bool WptManager::m_chg2_ovp_logged = false;
+    uint32_t WptManager::m_thermal_pause_adv_count = 0;
+    uint32_t WptManager::m_ovp_pause_adv_count = 0;
+    bool WptManager::m_thermal_probe_active = false;
+    uint32_t WptManager::m_thermal_probe_adv_count = 0;
+    uint16_t WptManager::m_thermal_probe_ticks = 0;
+    uint8_t WptManager::m_thermal_retry_count = 0;
+    uint8_t WptManager::m_thermal_trip_level = WptManager::LEVEL_INVALID;
+    bool WptManager::m_thermal_probe_no_ad = false;
     uint8_t WptManager::m_level_max_this_tick = WptManager::COLD_START_LEVEL;
     uint8_t WptManager::m_level_max_last_tick = WptManager::COLD_START_LEVEL;
 
@@ -408,12 +416,38 @@ namespace svc
         return TEMP_LOOKUP_TABLE[LOOKUP_TABLE_SIZE - 1].temp; // Return a safe default
     }
 
+    void WptManager::FailThermalProbe(bool no_ad)
+    {
+        const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
+
+        m_thermal_probe_active = false;
+        m_thermal_retry_count++;
+        m_thermal_probe_no_ad = no_ad;
+        m_thermal_pause_ticks = 0;
+        m_thermal_pause_adv_count = adv_count;
+
+        LOG_WARNING("WPT Manager: Blind thermal retry %d/%d failed (%s) at level %d, pausing again\n",
+                    m_thermal_retry_count, THERMAL_BLIND_RETRY_MAX,
+                    no_ad ? "no advertisement" : "still hot", m_level);
+
+        WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
+                                  static_cast<uint32_t>(PAUSE_THERMAL));
+
+        // No advertisement: the level was too low to boot the IPG. Queue one step
+        // up for the next attempt, never above the level that tripped.
+        if (no_ad && (m_thermal_trip_level != LEVEL_INVALID) && (m_level < m_thermal_trip_level))
+        {
+            SetPowerLevel(m_level + 1);
+        }
+    }
+
     void WptManager::IpgTemperatureMonitoring(void)
     {
         // With no advertisement parsed yet the thermistor fields are all zero, which
         // makes the resistance calculation degenerate and falls through to the
         // table's top entry (50 C) - an instant spurious thermal pause.
-        if (svc::BleManager::GetAdvertisementCount() == 0)
+        const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
+        if (adv_count == 0)
         {
             return;
         }
@@ -430,6 +464,22 @@ namespace svc
             m_thermal_pause_ticks++;
         }
 
+        // A blind retry is running: the stored reading is the stale one that caused
+        // the pause, so it must not be acted on. Wait for a fresh advertisement.
+        if (m_thermal_probe_active && !thermally_paused)
+        {
+            m_thermal_probe_ticks++;
+
+            if (adv_count == m_thermal_probe_adv_count)
+            {
+                if (m_thermal_probe_ticks >= THERMAL_PROBE_TIMEOUT_TICKS)
+                {
+                    FailThermalProbe(true);
+                }
+                return;
+            }
+        }
+
         // An implausible reading carries no temperature at all, so it can neither
         // pause nor resume: whatever state we are in is held until a real reading
         // arrives. Without this, a wrapped OUT byte computes as a negative
@@ -442,6 +492,13 @@ namespace svc
                         ChargingStatusParameters.GET_THERM_REF,
                         ChargingStatusParameters.GET_THERM_OUT,
                         ChargingStatusParameters.GET_THERM_OFST);
+
+            // A probe keeps waiting for the next fresh advertisement, still bounded
+            // by its timeout.
+            if (m_thermal_probe_active)
+            {
+                m_thermal_probe_adv_count = adv_count;
+            }
             return;
         }
 
@@ -454,6 +511,28 @@ namespace svc
            ChargingStatusParameters.GET_THERM_REF,
            ChargingStatusParameters.GET_THERM_OUT,
            ChargingStatusParameters.GET_THERM_OFST);
+
+        if (m_thermal_probe_active && !thermally_paused)
+        {
+            // First fresh reading after a blind retry. The retry skipped the
+            // cool-down check, so this reading has to pass the resume threshold.
+            m_thermal_probe_active = false;
+
+            if (ipg_temperature > IPG_TEMP_THRESHOLD_RESUME)
+            {
+                FailThermalProbe(false);
+                return;
+            }
+
+            LOG_INFO("WPT Manager: Blind thermal retry confirmed, IPG %d.%02d C at/below %d C, continuing at level %d\n",
+                     (int32_t)ipg_temperature,
+                     (int32_t)((ipg_temperature) * 100) % 100,
+                     IPG_TEMP_THRESHOLD_RESUME,
+                     m_level);
+            m_thermal_retry_count = 0;
+            m_thermal_probe_no_ad = false;
+            return;
+        }
 
         if (!thermally_paused)
         {
@@ -478,6 +557,12 @@ namespace svc
                           (int32_t)((ipg_temperature) * 100) % 100,
                           IPG_TEMP_THRESHOLD_PAUSE);
                 m_thermal_pause_ticks = 0;
+                m_thermal_pause_adv_count = adv_count;
+                m_thermal_probe_no_ad = false;
+                if (m_thermal_trip_level == LEVEL_INVALID)
+                {
+                    m_thermal_trip_level = m_level;
+                }
                 WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
                                           static_cast<uint32_t>(PAUSE_THERMAL));
             }
@@ -496,6 +581,49 @@ namespace svc
 
         if (ipg_temperature > IPG_TEMP_THRESHOLD_RESUME)
         {
+            // No advertisement since the pause began: the IPG runs on coil power
+            // and went dark with the coil, so this reading can never improve.
+            if (adv_count != m_thermal_pause_adv_count)
+            {
+                return;
+            }
+
+            if (m_thermal_retry_count >= THERMAL_BLIND_RETRY_MAX)
+            {
+                LOG_ERROR("WPT Manager: IPG silent after %d blind thermal retries, ending charge session",
+                          m_thermal_retry_count);
+                // Same path as a lost receiver: StateCharge -> StateWait, coil off.
+                // The count is left at the limit so no retry can start before
+                // DisableWpt() resets it.
+                WptPort::SendEventFromISR(WptPort::Event_e::WPT_SCAN_TIMEOUT, NULL);
+                return;
+            }
+
+            if (m_thermal_pause_ticks < (THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count))
+            {
+                return;
+            }
+
+            // A thermal trip means the level delivered too much power, so retry one
+            // step lower - unless the last retry already showed that level was too
+            // low to boot the IPG and was raised for this attempt.
+            if (!m_thermal_probe_no_ad && (m_level > MIN_POWER_LEVEL))
+            {
+                SetPowerLevel(m_level - 1);
+            }
+
+            m_floor_found = false;
+            m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+
+            m_thermal_probe_active = true;
+            m_thermal_probe_adv_count = adv_count;
+            m_thermal_probe_ticks = 0;
+
+            LOG_WARNING("WPT Manager: IPG silent for %d ticks in thermal pause, blind retry %d/%d at level %d\n",
+                        m_thermal_pause_ticks, m_thermal_retry_count + 1, THERMAL_BLIND_RETRY_MAX, m_level);
+
+            WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
+                                      static_cast<uint32_t>(PAUSE_THERMAL));
             return;
         }
 
@@ -510,6 +638,8 @@ namespace svc
         // is the only event that reopens it once a floor has been found.
         m_floor_found = false;
         m_blank_cycles = BLANK_CYCLES_AFTER_FAULT;
+        m_thermal_retry_count = 0;
+        m_thermal_probe_no_ad = false;
 
         WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
                                   static_cast<uint32_t>(PAUSE_THERMAL));
@@ -617,6 +747,7 @@ namespace svc
                       m_level, fault_level, m_ovp_ceiling);
 
             m_ovp_pause_ticks = 0;
+            m_ovp_pause_adv_count = adv_count;
             WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
                                       static_cast<uint32_t>(PAUSE_OVP));
             return;
@@ -629,7 +760,14 @@ namespace svc
             return;
         }
 
-        if (vrect_ovp)
+        if (adv_count == m_ovp_pause_adv_count)
+        {
+            // No advertisement since the pause: a coil-powered IPG went dark with
+            // the coil, so the stored VRECT_OVPn is stale and can never clear.
+            LOG_WARNING("WPT Manager: IPG silent for %d ticks in OVP pause, treating fault as cleared\n",
+                        m_ovp_pause_ticks);
+        }
+        else if (vrect_ovp)
         {
             LOG_WARNING("WPT Manager: VRECT_OVPn still 0 after %d ticks, staying paused\n", m_ovp_pause_ticks);
             return;
@@ -703,6 +841,14 @@ namespace svc
         m_chg2_ovp_logged = false;
         m_level_max_this_tick = COLD_START_LEVEL;
         m_level_max_last_tick = COLD_START_LEVEL;
+        m_thermal_pause_adv_count = 0;
+        m_ovp_pause_adv_count = 0;
+        m_thermal_probe_active = false;
+        m_thermal_probe_adv_count = 0;
+        m_thermal_probe_ticks = 0;
+        m_thermal_retry_count = 0;
+        m_thermal_trip_level = LEVEL_INVALID;
+        m_thermal_probe_no_ad = false;
 
         LOG_INFO("WPT Manager: Power control reset, level %d\n", m_level);
     }

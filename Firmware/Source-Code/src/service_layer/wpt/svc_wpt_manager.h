@@ -223,6 +223,19 @@ namespace svc
         // counted in FAULT_MONITOR_PERIOD_MS ticks. 15 * 2 s = 30 s.
         static constexpr uint16_t THERMAL_PAUSE_MIN_TICKS = 15;
 
+        // Blind thermal retry. Below ~3.2 V the IPG runs on rectified coil power, so
+        // a thermal pause switches it off and no fresh temperature can ever arrive to
+        // satisfy the resume threshold. When a pause sees no new advertisement, the
+        // coil is re-enabled one step lower after 30 s, 60 s, 120 s, 240 s (base <<
+        // failed retries) until the IPG reports again, and the session ends after
+        // THERMAL_BLIND_RETRY_MAX failures.
+        static constexpr uint16_t THERMAL_BLIND_RETRY_BASE_TICKS = 15; // 30 s
+        static constexpr uint8_t THERMAL_BLIND_RETRY_MAX = 4;
+
+        // How long a blind retry waits for a fresh advertisement before it counts as
+        // failed. 10 * 2 s = 20 s; a drained IPG advertised ~1 s after cold start.
+        static constexpr uint16_t THERMAL_PROBE_TIMEOUT_TICKS = 10;
+
         // Minimum time held in an OVP pause, in fault-monitor ticks. 5 * 2 s = 10 s.
         static constexpr uint16_t OVP_PAUSE_MIN_TICKS = 5;
 
@@ -391,6 +404,29 @@ namespace svc
         // False until the first control cycle with real BLE data, which forces the
         // level to COLD_START_LEVEL regardless of where cold start left it.
         static bool m_loop_initialized;
+
+        // Advertisement counter when the current thermal / OVP pause started (or
+        // the last blind retry ended). Unchanged while paused = the IPG is dark.
+        static uint32_t m_thermal_pause_adv_count;
+        static uint32_t m_ovp_pause_adv_count;
+
+        // Blind thermal retry state. While a probe is active the stored (stale)
+        // temperature is ignored until a fresh advertisement arrives, and that first
+        // fresh reading must satisfy the resume threshold, not just the pause one.
+        static bool m_thermal_probe_active;
+        static uint32_t m_thermal_probe_adv_count;
+        static uint16_t m_thermal_probe_ticks;
+        static uint8_t m_thermal_retry_count;
+        // Level in force when the thermal pause first tripped; retries never exceed it.
+        static uint8_t m_thermal_trip_level;
+        // True when the last retry failed for lack of an advertisement, meaning the
+        // level was already raised for the next attempt and must not be stepped down.
+        static bool m_thermal_probe_no_ad;
+
+        /// Ends a blind thermal retry that failed and re-pauses the coil.
+        ///
+        /// @param no_ad true if the IPG never advertised (level too low to boot it)
+        static void FailThermalProbe(bool no_ad);
 
         // Advertisement counter seen at the last OVP evaluation; a fault is acted
         // on only when it arrives in a new advertisement. Deliberately not reset by
