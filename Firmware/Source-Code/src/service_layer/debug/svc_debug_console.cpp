@@ -11,6 +11,7 @@
 
 #if WPT_MANUAL_DEBUG_MODE
 
+#include "app_error.h"
 #include "app_port.h"
 #include "app_system.h"
 #include "eda_manager_log_config.h"
@@ -139,6 +140,14 @@ namespace svc
 
         case 'x':
             StopCoil();
+            break;
+
+        case '!':
+            ForceAppError();
+            break;
+
+        case '#':
+            ForceHardFault();
             break;
 
         default:
@@ -315,6 +324,29 @@ namespace svc
         LOG_WARNING("[MANUAL] m/n enter/exit manual   s/x coil start/stop\n");
         LOG_WARNING("[MANUAL] +/- step PTH            0-9,a,b,c set PTH 0-12\n");
         LOG_WARNING("[MANUAL] ?   status              h   this help\n");
+        LOG_WARNING("[MANUAL] !   crash test (error)  #   crash test (hard fault)\n");
+    }
+
+    void DebugConsole::ForceAppError()
+    {
+        // Self-test for the crash recorder: the board should reset within a
+        // moment and print the record - file, line and error code - on the way
+        // back up, in this same RTT session.
+        LOG_WARNING("[MANUAL] Crash test: forcing an APP_ERROR_CHECK fault\n");
+
+        APP_ERROR_CHECK(NRF_ERROR_INTERNAL);
+    }
+
+    void DebugConsole::ForceHardFault()
+    {
+        LOG_WARNING("[MANUAL] Crash test: forcing a hard fault\n");
+
+        // Reads inside the system region fault precisely, and with no BusFault
+        // handler enabled that escalates straight to a HardFault. volatile keeps
+        // the compiler from discarding the access.
+        volatile uint32_t const *const p_bad_address = reinterpret_cast<volatile uint32_t *>(0xFFFFFFF0u);
+
+        (void)*p_bad_address;
     }
 
     void DebugConsole::PrintStatus()

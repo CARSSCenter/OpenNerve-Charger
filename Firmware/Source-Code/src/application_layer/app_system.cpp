@@ -14,6 +14,7 @@
 #include "eda_active_object_priorities.h"
 #include "eda_manager.h"
 #include "svc_ble_subsystem.h"
+#include "svc_crash_record.h"
 #include "svc_debug_console.h"
 #include "svc_pmc_manager.h"
 #include "svc_wpt_manager.h"
@@ -37,6 +38,11 @@ namespace app
     void System::Init()
     {
         eda::Manager::Initialize();
+
+        // Straight after the log backend and before the SoftDevice is enabled:
+        // RESETREAS may only be read and cleared while the SoftDevice is off, and
+        // a crash from the previous run should be the first thing in the log.
+        svc::CrashRecord::ReportAtBoot();
 
         mSystemActiveObject.InitTask(eda::ActiveObjectPriorities_e::app, "SystemActiveObject");
         mSystemPort.Init(PortList_e::SYSTEM_PORT, mSystemActiveObject);
@@ -72,8 +78,19 @@ namespace app
     {
         static uint32_t heartbeat = 0;
 
+        // One heartbeat every 5 s, so this reports once a minute.
+        static constexpr uint32_t STACK_REPORT_INTERVAL = 12;
+
         heartbeat += 1;
-        LOG_INFO("Heartbeat value %d\n", heartbeat); 
+        LOG_INFO("Heartbeat value %d\n", heartbeat);
+
+        // Lets a crash report say how far into the run the fault happened.
+        svc::CrashRecord::NoteHeartbeat(heartbeat);
+
+        if ((heartbeat % STACK_REPORT_INTERVAL) == 0)
+        {
+            svc::CrashRecord::LogStackHeadroom();
+        }
 
         svc::WptManager &wptManager = svc::WptManager::Instance();
         wptManager.GetTemperature();

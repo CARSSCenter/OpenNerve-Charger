@@ -1075,6 +1075,34 @@ This also resolves the §11 note about `state_slow_charge_and_scan.cpp:29` ("a l
 
 **Status.** Syntax-checked (no errors in first-party code). Not hardware-tested.
 
+### 8.10 — 2026-09-17 Crash instrumentation: faults reset and report instead of halting
+
+**Symptom.** The charger dies mid-session. RTT stops on an ordinary line, Button 1 and Button 2 do nothing, unplugging the bench supply does not help, and only re-flashing brings it back. It has happened while charging, in manual mode with the coil off, and while completely idle with nothing but the 5 s heartbeat running (`charger-20260917-092302.log`); one instance coincided with physically moving the transmit coil. No fault text, no assert text and no reboot appears in any of the logs.
+
+**Why it looked like dead hardware.** This is a Debug build (`DEBUG` and `DEBUG_NRF`), and every SDK fault path — `APP_ERROR_CHECK`, `ASSERT`, `NRFX_ASSERT`, FreeRTOS `configASSERT`, and `HardFault_c_handler` — executes `NRF_BREAKPOINT_COND` before doing anything else. That macro is a breakpoint instruction whenever a debugger is attached, and the J-Link is attached for the whole session because it is what carries RTT. The core halts there; `app_error_fault_handler` would then have spun in `app_error_save_and_stop()` with interrupts disabled anyway. A halted core runs no interrupt handlers, which is why Button 2 — a GPIOTE ISR that calls `NVIC_SystemReset()` — stops working, and why only re-flashing recovers: re-flashing ends with a debugger reset. Nothing about that behaviour depended on what the original fault was.
+
+**Changes.**
+
+| File | Change |
+|------|--------|
+| `src/service_layer/debug/svc_crash_record.{h,cpp}` | **New.** Strong overrides of `app_error_fault_handler`, `HardFault_Handler` and `vApplicationStackOverflowHook`. Each records what it knows — fault type, PC, LR, PSR, error code, file and line, `CFSR`/`HFSR`/`MMFAR`/`BFAR`, task name, heartbeat count — into a `.non_init` block and calls `NVIC_SystemReset()`. `ReportAtBoot()` prints the reset reason and any stored record; `LogStackHeadroom()` reports unused stack |
+| `src/project/config/sdk_config.h` | `NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED` 0 → **1**; `HARDFAULT_HANDLER_ENABLED` 1 → **0** (the SDK handler's Debug path breakpoints before any recorder could run) |
+| `external/freertos/config/FreeRTOSConfig.h` | `configCHECK_FOR_STACK_OVERFLOW` 0 → **2** |
+| `eda_manager.cpp` | `IdleHook()`'s `NRF_LOG_PROCESS()` is now behind `#if NRF_LOG_DEFERRED` |
+| `svc_wpt_manager.cpp` | Dropped the bare `LOG_FLUSH()` at the end of `FaultMonitoring()` |
+| `eda_active_object.{h,cpp}` | `InitTask()` records each task handle; `TaskCount()` / `TaskAt()` expose them for stack reporting |
+| `app_system.cpp` | `ReportAtBoot()` on startup; the heartbeat feeds `NoteHeartbeat()` and logs stack headroom once a minute |
+| `svc_debug_console.{h,cpp}` | Manual-mode keys `!` and `#` force an app error and a hard fault, to exercise the recorder |
+| `svc_debug_config.h` | New `CRASH_HALT_ON_FAULT` (default 0); set it to 1 to restore the halting behaviour for a real SES debug session |
+
+**Why a soft reset is the right response.** `NVIC_SystemReset()` leaves both the RAM contents and the debug connection intact — the logs show earlier resets mid-session with RTT streaming straight through (`charger-20260910-150842.log`). So the crash report arrives in the same RTT session a second later, and the charger carries on instead of waiting to be re-flashed.
+
+**The trigger is still open.** The strongest firmware suspect is the logger itself. Logging is in-place (`NRF_LOG_DEFERRED 0`), and while the write side (`buf_prealloc`) takes a critical region, the dequeue that every `LOG_*` call performs did not. Log calls come from six contexts — the WPT and PMC tasks, the timer daemon, the app task, the BLE task and the button GPIOTE ISR — at roughly 160 lines/s sustained. Interrupting a dequeue corrupts the read index and the memobj pool, which would produce exactly this: a fault with no message, because the logger is what broke. The critical-region change above closes that; a session at `NRF_LOG_DEFAULT_LEVEL 3` is the cheap way to test the same theory from the other side. The remaining candidates are a supply dip or EMI burst (the charger runs from 3×AA), and stack overflow, which was previously undetected.
+
+**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states (54 first-party files, 0 errors, only the pre-existing NULL-conversion warnings). Not hardware-tested.
+
+---
+
 ## 9. Event Flow — Complete Happy Path
 
 ### 9.1 IPG already advertising (awake)
@@ -1214,6 +1242,40 @@ Operator presses 'n'
                          timers, WPT_POWER_OFF, STOP_SCANNING, PMC_POWER_OFF, LED off
 ```
 
+### 9.4 Hang and crash triage
+
+With the instrumented build (§8.10), a fault should no longer strand the board:
+
+```
+Fault (assert, APP_ERROR_CHECK, hard fault, stack overflow)
+  → svc_crash_record: fill the .non_init record, one best-effort log line
+  → NVIC_SystemReset()          ← the J-Link connection and RTT session survive this
+  → next boot, before the SoftDevice is enabled:
+      "Boot N: reset reason 0x... (software reset)"
+      "CRASH RECORD: <type> in task '<name>', <n> heartbeats into the run"
+      "  error <code> [<name>] at <file>:<line>"     (APP_ERROR_CHECK)
+      "  pc 0x... lr 0x... psr 0x..."
+      "  cfsr ... hfsr ... mmfar ... bfar ..."        (hard fault)
+  → the charger keeps running
+```
+
+**Check the mechanism first.** In manual mode, `!` forces an `APP_ERROR_CHECK` failure and `#` forces a hard fault. Each should reset the board and print a record naming `svc_debug_console.cpp`.
+
+**If a hang still happens with no reset**, the core is halted, locked up or unpowered — do not re-flash, because re-flashing destroys the evidence. Restart JLinkExe (`-device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1`) and capture:
+
+| Command | Reads |
+|---------|-------|
+| `mem32 0xE000EDF0 1` | DHCSR — bit 17 halted, bit 18 sleeping, bit 19 locked up |
+| `halt` then `regs` | PC, LR, SP and xPSR (its low 9 bits name the active exception) |
+| `mem32 0xE000ED28 1` | CFSR |
+| `mem32 0xE000ED2C 1` | HFSR |
+| `mem32 0xE000ED38 1` | BFAR |
+| `mem32 0x40000400 1` | RESETREAS |
+
+Map the addresses with `arm-none-eabi-addr2line -f -C -e <Output/.../hornet-wpt-charger.elf> <PC> <LR>`, or attach from SES (Debug → Attach Debugger, which neither resets nor downloads) and read the call stack. Then `r` and `g`: if the charger comes back, flash was never the problem and the earlier recoveries were just the debugger's reset.
+
+**Power is the other half.** The board runs from 3×AA, so unplugging a bench supply is not necessarily a power-on reset, and an attached J-Link can back-power the nRF. A genuine power cycle means supply off, cells out and the J-Link unplugged. `RESETREAS` reading 0 on the next boot is what confirms the supply was actually interrupted.
+
 ---
 
 ## 10. Constants Reference
@@ -1271,11 +1333,24 @@ NTC_R0                            = 5000     // Ω — local NTC at 25°C
 NTC_BETA                          = 3480
 ```
 
-**`svc_debug_config.h`** (debug console — see §4.7):
+**`svc_debug_config.h`** (debug console — see §4.7; fault handling — see §8.10):
 ```cpp
 WPT_MANUAL_DEBUG_MODE      = 0         // 1 = compile the console and StateManual in
 WPT_MANUAL_POLL_PERIOD_MS  = 100       // ms — RTT keystroke poll
 WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idle; 0 disables
+CRASH_HALT_ON_FAULT        = 0         // 1 = breakpoint before resetting, for SES debug sessions
+```
+
+**Fault and logging configuration** (§8.10) — easy to regress, and the symptom is a board that looks dead:
+```cpp
+// src/project/config/sdk_config.h
+NRF_LOG_DEFERRED                             = 0     // in-place: each log call formats and writes
+NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED = 1     // ...and must hold the lock while it does
+HARDFAULT_HANDLER_ENABLED                    = 0     // the SDK handler is replaced by svc_crash_record
+NRF_LOG_DEFAULT_LEVEL                        = 4     // DEBUG; level 3 cuts most of the ~160 lines/s
+
+// external/freertos/config/FreeRTOSConfig.h
+configCHECK_FOR_STACK_OVERFLOW               = 2     // pattern check at every context switch
 ```
 
 ---
@@ -1308,5 +1383,9 @@ WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idl
 - **Pause during coil-powered charging is blind:** While a drained IPG is paused it cannot report temperature; the blind retry (§6.5) bounds the exposure but still re-enables the coil without a fresh reading. A keep-alive power level (§8.8) would remove the blind period if bench data shows it is thermally safe.
 
 - **Completion thresholds assume the current IPG:** `BATTERY_PRESENT_MV` / `BATTERY_FULL_MV` (§7) rely on the IPG's 100 mV battery encoding and the LTC4065's 4.2 V float. An IPG firmware that stops sending battery voltages (both channels < 1 V) would never end a session on its own.
+
+- **A silent hang is still possible, and nothing resets the board:** the crash recorder (§8.10) only covers faults the CPU actually raises. A deadlock, a stuck interrupt or a busy-wait that never ends produces no fault, so the board still stops with no record. There is no watchdog — `NRFX_WDT_ENABLED` is 0 — and enabling one (paused while the debugger halts the core, fed from the heartbeat) would turn that last class of hang into a reset with `RESETREAS = DOG`.
+
+- **ISR-safe kernel calls are made from task context:** the WPT timer callbacks (`StatusTimeoutMonitoring`, `IpgTemperatureMonitoring`, `IpgOvpMonitoring`, `FailThermalProbe`) and `SetPowerLevel()` reach `Port::SendEventFromISR()`, which calls `xQueueSendFromISR` and `portYIELD_FROM_ISR` — but they run on the timer daemon task, not in an interrupt. It works today and the queue is protected either way, so this is hygiene rather than a defect. The related gap is that neither `SendEvent()` nor `SendEventFromISR()` checks its return value, so a full 20-deep queue drops events silently.
 
 - **`WptManager::RearmPowerSearch()` has no callers** (§6.2) — kept deliberately, but dead code today.

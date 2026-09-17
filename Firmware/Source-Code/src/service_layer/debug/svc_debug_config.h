@@ -31,4 +31,18 @@
 /// walked-away-from session) has nothing watching the coil at all.
 #define WPT_MANUAL_DEADMAN_MS 600000 // 10 minutes
 
+/// Fault handling (svc_crash_record.cpp), independent of the console above.
+///
+/// 0 = record the fault in no-init RAM and reset immediately. The next boot
+///     prints the record over RTT, and because a soft reset does not drop the
+///     debug connection, it lands in the same RTT session seconds later.
+/// 1 = also execute a breakpoint before resetting, which halts the core whenever
+///     a debugger is attached. Use this only when driving a real debug session
+///     from SES: with a J-Link attached for RTT logging it is what leaves the
+///     board apparently dead until it is re-flashed.
+///
+/// The SDK default is the equivalent of 1 in Debug builds - a breakpoint and
+/// then an endless loop with interrupts off, which never recovers.
+#define CRASH_HALT_ON_FAULT 0
+
 #endif // SVC_DEBUG_CONFIG_H

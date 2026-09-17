@@ -1067,7 +1067,5 @@ namespace svc
             DebugConsole::LogIpgBits();
         }
 #endif
-
-        LOG_FLUSH();
     }
 }

@@ -236,6 +236,7 @@
         <file file_name="../../service_layer/pmc/svc_pmc_subsystem.cpp" />
       </folder>
       <folder Name="debug">
+        <file file_name="../../service_layer/debug/svc_crash_record.cpp" />
         <file file_name="../../service_layer/debug/svc_debug_console.cpp" />
       </folder>
       <folder Name="wpt">

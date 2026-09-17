@@ -76,6 +76,12 @@ namespace svc
         static void PrintStatus();
         static void PrintHelp();
 
+        /// Deliberate faults, for exercising the crash recorder end to end. Each
+        /// should reset the board and be reported by the next boot rather than
+        /// leaving it dead until it is re-flashed.
+        static void ForceAppError();
+        static void ForceHardFault();
+
         static eda::Timer mPollTimer;
 
         /// True exactly while the application state machine is in StateManual.
