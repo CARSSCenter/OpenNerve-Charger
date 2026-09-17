@@ -38,7 +38,8 @@ namespace eda
     {
         if (mTimerHandle != NULL)
         {
-            xTimerChangePeriod(mTimerHandle, period, 0U);
+            // period is in milliseconds, as in the constructor; the kernel wants ticks.
+            xTimerChangePeriod(mTimerHandle, pdMS_TO_TICKS(period), 0U);
             xTimerStart(mTimerHandle, 0U);
             return TimerErrorCode::SUCCESS;
         }
@@ -73,7 +74,7 @@ namespace eda
     {
         if (mTimerHandle != NULL)
         {
-            xTimerChangePeriodFromISR(mTimerHandle, period, 0U);
+            xTimerChangePeriodFromISR(mTimerHandle, pdMS_TO_TICKS(period), 0U);
             xTimerStartFromISR(mTimerHandle, 0U);
             return TimerErrorCode::SUCCESS;
         }

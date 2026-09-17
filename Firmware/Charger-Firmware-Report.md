@@ -25,11 +25,9 @@ There are 13 DAC steps (0–12), each corresponding to an increasing power trans
 | DAC voltage | Step | Role |
 |-------------|------|------|
 | 400 mV | 0 (minimum) | Floor of the search range |
-| 500 mV | 1 | — |
-| … | … | — |
-| 1100 mV | 7 | Cold-start level, and where the closed loop begins |
-| … | … | — |
-| 1600 mV | 12 (maximum) | Maximum — cold-start escalation target (only if `COLD_START_ESCALATION_ENABLED`) |
+| 500 mV | 1 | Cold-start level (`COLD_START_LEVEL`) — the reset level and the first step of the cold-start ramp |
+| … | … | Cold-start ramp steps, one every 30 s |
+| 1600 mV | 12 (maximum) | Maximum — top of the cold-start ramp |
 
 **CTD pin:** LTC4125 `CTD` (pin 14) has a 36 pF capacitor to GND, which sets the delay between OPS cycles. MCU pin **P0.05 (`WPT_CTD_CTRL`)** drives a MOSFET gate; when that MOSFET is on, it shorts the capacitor and ties `CTD` directly to GND.
 
@@ -138,7 +136,7 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
 | `WPT_FAULT_CONDITION` | 0x08 | Fault detected |
 | `WPT_BATTERY_CHARGING` | 0x09 | BLE confirms charging in progress |
 | `WPT_BATTERY_CHARGED` | 0x0B | BLE confirms all batteries full |
-| `WPT_SLOW_CHARGE` | 0x0C | Begin the open-loop cold-start attempt (step 7; escalates to max only if `COLD_START_ESCALATION_ENABLED`, off by default) |
+| `WPT_SLOW_CHARGE` | 0x0C | Begin the open-loop cold-start ramp (step 1, +1 step every 30 s until an advertisement or step 12) |
 | `WPT_SCAN_TIMEOUT` | 0x0D | Power search timed out |
 | `WPT_ADJUST_POWER` | 0x0E | Set specific DAC step. Handled in `StateCharging` and `StateSlowCharge`; **dropped** in `StateIdle` (§6.1) |
 | `WPT_FAULT_PAUSE` | 0x0F | Suspend coil output; `optDataAddress` carries the `PauseReason_e` (`PAUSE_THERMAL`, `PAUSE_OVP`, or in debug builds `PAUSE_MANUAL`) |
@@ -176,9 +174,9 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
               ▼                         ▼
    ┌──────────────────┐    ┌────────────────────────────┐
    │   StateCharge    │    │   StateSlowChargeAndScan   │ ← White LED
-   │  (Yellow LED)    │    │   Cold start: step 7, then │
-   └──────┬───────────┘    │   max after 5 s            │
-          │                │   BLE scanning (10 s)      │
+   │  (Yellow LED)    │    │   Cold start: step 1, +1   │
+   └──────┬───────────┘    │   every 30 s up to 12      │
+          │                │   BLE scanning (390 s)     │
           │                └──────────┬─────────────────┘
           │                          │ BLE_DEVICE_FOUND
           │                          │
@@ -187,7 +185,7 @@ Each subsystem exposes a **port** (a message queue). State machines communicate 
           │ BATTERY_CHARGED → StateWait (green LED)
           │ BUTTON_PRESSED  → StateWait
           │ TURN_OFF        → StateWait   (unreachable in production builds — see §3.2)
-          │ WPT_SCAN_TIMEOUT → StateWait  (unreachable — see §11, GetStat() stub)
+          │ WPT_SCAN_TIMEOUT → StateWait  (thermal blind-retry give-up only — see §6.5, §11)
 ```
 
 **Debug builds add `StateManual` (§4.7).** `StateWait`, `StateScan`, `StateSlowChargeAndScan` and `StateCharge` each move to it on `MANUAL_TAKEOVER`; only `TURN_OFF` (the console's `n`) returns it to `StateWait` — Button 1 is ignored there. It is not drawn above because it does not exist in a production build.
@@ -227,7 +225,7 @@ Exit:
   hal::Leds::LedScanOn(false)
 ```
 
-When no IPG is found within the 10-second scan window, the charger assumes the IPG may be powered off. It enters `StateSlowChargeAndScan`, which drives the coil at step 7 to boot a drained IPG from wireless power, then scans for up to 30 seconds to catch the BLE advertisement after initialization.
+When no IPG is found within the 10-second scan window, the charger assumes the IPG may be powered off. It enters `StateSlowChargeAndScan`, which ramps the coil up from step 1 to boot a drained IPG from wireless power, and scans for up to 390 seconds to catch the BLE advertisement after initialization.
 
 Note the ordering: `ChangeState` runs `StateScan::Exit()` (which sends `WPT_POWER_ON`, taking the WPT SM from `StateIdle` to `StateCharging`) *before* `StateSlowChargeAndScan::Entry()` sends `WPT_SLOW_CHARGE`. So `WPT_SLOW_CHARGE` is always handled by `StateCharging`, never by the WPT SM's own `StateSlowCharge` — see §11.
 
@@ -235,9 +233,9 @@ Note the ordering: `ChangeState` runs `StateScan::Exit()` (which sends `WPT_POWE
 
 ```
 Entry:
-  BleManager::SetScanTimeout(30000)     ← 30 s window for IPG boot time
+  BleManager::SetScanTimeout(390000)    ← 390 s: full cold-start ramp + 30 s at max
   BlePort::START_SCANNING
-  WptPort::WPT_SLOW_CHARGE              ← cold start: step 7 (escalation to max off by default)
+  WptPort::WPT_SLOW_CHARGE              ← cold start: ramp from step 1, +1 every 30 s
   PmcPort::PMC_POWER_ON                 ← VCC_EN high (5V rail for LTC4125)
   hal::Leds::LedChargingSlow(true)      ← white LED
 
@@ -269,18 +267,20 @@ Exit:
   hal::Leds::LedChargingSlow(false)
 ```
 
-**Cold-start power profile:** `WPT_SLOW_CHARGE` no longer clamps the DAC to minimum. Minimum power (step 0, 400 mV) was never enough to bring a fully drained IPG's VRECT up to boot, which is the entire purpose of this state. Instead `WptManager::StartColdStartEscalation()` drives step 7 immediately. Escalating to maximum power is optional, controlled by `COLD_START_ESCALATION_ENABLED` in `svc_wpt_manager.h`:
+**Cold-start power profile (ramp, since 2026-09-17):** with no BLE there is no PGOOD or OVP telemetry, so this window is open-loop by necessity. `WptManager::StartColdStartRamp()` sets `COLD_START_LEVEL` (step 1, 500 mV) and starts the periodic `mColdStartRampTimer`. Every `COLD_START_STEP_MS` (30 s) `ColdStartRampStep()` raises the level by one step, until:
 
-| `COLD_START_ESCALATION_ENABLED` | Behaviour |
+| Condition | Action |
 |---|---|
-| `false` (default since 2026-09-11) | Step 7 for the whole scan window; the escalation timer is never started. If step 7 cannot boot a drained IPG, the window times out and the charger returns to `StateWait` |
-| `true` | Also starts a one-shot `COLD_START_ESCALATE_MS` timer; if no advertisement has been parsed by then, it escalates to maximum power for the remainder of the window |
+| An advertisement has arrived since the ramp started | Stop the timer, log `Cold start ramp ended at level N`; the closed loop keeps that level (§6.3) |
+| A fault pause is active | Skip the step (defensive; faults need telemetry, so this should not occur) |
+| Level already at the maximum (12) | Stop the timer, log `holding at maximum level`, stay there for the rest of the window |
+| Otherwise | `SetPowerLevel(m_level + 1)`, log `Cold start ramp stepping up to level N` |
 
-**If you enable it, `COLD_START_ESCALATE_MS` must be well below `SCAN_TIMEOUT_SLOW_CHARGE_MS`.** Both are currently 30 s. The scan timeout ends the state through `DisableWpt()`, which stops the escalation timer, so with equal values the escalation either never fires or lasts only milliseconds before the coil turns off.
+`StartIpgTemperaturePgoodMonitoringTimer()` also stops the ramp, so it ends as soon as the app sees the IPG; `DisableWpt()` stops it when the window times out. The ramp's own advertisement check compares against the count recorded when the ramp started — the counter runs from boot, so "no advertisement yet" means *unchanged*, not zero.
 
-This window is open-loop by necessity — with no BLE there is no PGOOD and no OVP telemetry, so nothing can be steered by. When enabled, the escalation callback self-guards on `BleManager::GetAdvertisementCount() == 0`, so if an advertisement arrives while the timer is pending it fires harmlessly and the closed loop keeps ownership of the power level. That removes any need to cancel the timer on the BLE-found path.
+**Why a ramp.** Jumping straight to step 7 (the previous cold-start level) occasionally damaged the IPG's rectifier. The ramp brings power up one 100 mV step at a time, and nothing anywhere now raises the level by more than one step at once.
 
-§8.3 shortened the scan window from 30 s to 10 s alongside the escalation; on 2026-09-11 it went back to 30 s with escalation off by default (§8.7). If wake-up of a drained IPG fails at step 7, the two levers are this window (`SCAN_TIMEOUT_SLOW_CHARGE_MS`) and escalation — max power shortens the IPG's boot time but not the time it needs to start advertising afterwards.
+**Window length.** `SCAN_TIMEOUT_SLOW_CHARGE_MS` = 390 s = 12 steps × 30 s (step 1 → 12) plus 30 s at step 12. It must be kept in sync with `COLD_START_LEVEL` and `COLD_START_STEP_MS` by hand. The previous optional jump to maximum (`COLD_START_ESCALATION_ENABLED`, `COLD_START_ESCALATE_MS`, §8.7) has been removed.
 
 **Key design decisions on BLE_DEVICE_FOUND:** When the IPG is detected, WPT and VCC are left enabled intentionally. `StateCharge::Entry()` sends `WPT_POWER_ON` to ensure the WPT service is in `StateCharging` regardless of which path led here, and `PMC_POWER_ON` is a no-op in `PmcStateEnable` (PMC was already enabled in this state's `Entry()`). This avoids any disable/enable round-trip that would briefly cut power to the still-booting IPG.
 
@@ -343,8 +343,8 @@ Entry:
   PmcPort::PMC_POWER_ON                   ← VCC_EN high
   BlePort::START_SCANNING                 ← IPG telemetry for the warn-only monitors
   WptPort::WPT_MANUAL_IDLE                ← queued behind the previous state's WPT events:
-                                            coil off, timers stopped, escalation cancelled,
-                                            level → step 7, WPT SM → StateIdle, then
+                                            coil off, timers stopped, ramp cancelled,
+                                            level → step 1, WPT SM → StateIdle, then
                                             fault monitoring only
   magenta LED
 
@@ -385,10 +385,10 @@ Thermal and OVP are warn-only (§6.5, §6.6), the raw IPG fault bits are logged 
 |---|---|---|
 | `StateWait` | nothing | worked |
 | `StateScan` | `WPT_POWER_ON` | coil came on once VCC_EN rose |
-| `StateSlowChargeAndScan` | nothing — coil already on | coil stayed on; a pending cold-start escalation (only with `COLD_START_ESCALATION_ENABLED`) could take it to step 12 |
+| `StateSlowChargeAndScan` | nothing — coil already on | coil stayed on; the running cold-start ramp kept raising the level |
 | `StateCharge` | `WPT_POWER_OFF` | its `DisableWpt()` stopped the fault timer `Entry()` had just started |
 
-`WPT_MANUAL_IDLE` is queued behind those events on the same port, so FIFO order makes it the last word; its handler is `WptManager::EnterManualIdle()`. A cold-start escalation expiring at the same moment cannot leave the level at step 12: `DisableWpt()` posts the timer's stop before `ResetPowerControl()`, and the FreeRTOS timer task (priority 2) preempts the WPT task (1) on that post, so the escalation runs before the reset, not after. The one visible residue is entry from `StateScan`, whose queued `WPT_POWER_ON` still drives `WPT_ENn` low for well under a millisecond before `WPT_MANUAL_IDLE` is processed — normally with VCC_EN still off, since `StateScan` never raises it.
+`WPT_MANUAL_IDLE` is queued behind those events on the same port, so FIFO order makes it the last word; its handler is `WptManager::EnterManualIdle()`. A cold-start ramp step expiring at the same moment cannot leave the level raised: `DisableWpt()` posts the timer's stop before `ResetPowerControl()`, and the FreeRTOS timer task (priority 2) preempts the WPT task (1) on that post, so the step runs before the reset, not after. Manual idle therefore rests at step 1, and `s` starts the coil there. The one visible residue is entry from `StateScan`, whose queued `WPT_POWER_ON` still drives `WPT_ENn` low for well under a millisecond before `WPT_MANUAL_IDLE` is processed — normally with VCC_EN still off, since `StateScan` never raises it.
 
 The same revision let Button 1 leave manual mode without clearing the console's flag, which demoted thermal and OVP to warn-only in the next automatic session. Button 1 is now ignored in `StateManual`, and the flag is owned by the state itself (`OnManualEntered()`/`OnManualExited()`), so the two cannot disagree.
 
@@ -412,15 +412,17 @@ Two states:
 | Constant | Value | Used in |
 |----------|-------|---------|
 | `SCAN_TIMEOUT_MS` | 10,000 ms | `StateScan`, `StateCharge` |
-| `SCAN_TIMEOUT_SLOW_CHARGE_MS` | 30,000 ms | `StateSlowChargeAndScan` |
+| `SCAN_TIMEOUT_SLOW_CHARGE_MS` | 390,000 ms | `StateSlowChargeAndScan` — sized for the cold-start ramp (§4.5) |
 
-`SetScanTimeout(ms)` must be called before `StartScanning()` (or between advertisements) to take effect. `StateSlowChargeAndScan::Entry()` calls it with `SCAN_TIMEOUT_SLOW_CHARGE_MS`; `StateSlowChargeAndScan::Exit()` restores `SCAN_TIMEOUT_MS`. The cold-start window is currently the longer of the two (30 s vs 10 s).
+`SetScanTimeout(ms)` must be called before `StartScanning()` (or between advertisements) to take effect. `StateSlowChargeAndScan::Entry()` calls it with `SCAN_TIMEOUT_SLOW_CHARGE_MS`; `StateSlowChargeAndScan::Exit()` restores `SCAN_TIMEOUT_MS`. The cold-start window is currently the longer of the two (390 s vs 10 s).
+
+`eda::Timer::Start(period)` / `StartFromISR(period)`, which these timeouts use, converted nothing before 2026-09-17 and passed milliseconds to FreeRTOS as ticks. At `configTICK_RATE_HZ` = 1024 every scan window ran about 2.3 % short (10 s → 9.77 s; 390 s would have been 381 s). They now apply `pdMS_TO_TICKS()`, as the constructor always did.
 
 **Advertisement counter.** `BleManager` maintains `mAdvertisementCounter`, incremented in `ParseManufacturerSpecificData()` immediately after the payload fields are written and before `DEVICE_FOUND` is sent, exposed via `GetAdvertisementCount()`. Ordering matters: any consumer that observes a new count is guaranteed to see the data that arrived with it.
 
 It exists because `GetAdvertisementData()` alone gives no way to tell how old its contents are, and two separate failure modes follow from that:
 
-- **Validity.** A count of zero means no advertisement has *ever* been parsed, so `mAdvertisementData` is still all zeros. Since the IPG's fault bits are active-low, all-zero reads as *every fault asserted*, and the all-zero thermistor fields make the resistance calculation degenerate into a 50 °C reading. Both the OVP and temperature monitors bail out while the count is zero — without that, the charger would fault-pause on every startup.
+- **Validity.** A count of zero means no advertisement has *ever* been parsed, so `mAdvertisementData` is still all zeros. Since the IPG's fault bits are active-low, all-zero reads as *every fault asserted*, and the all-zero thermistor fields make the resistance calculation degenerate into a 50 °C reading. Both the OVP and temperature monitors bail out while the count is zero — without that, the charger would fault-pause on every startup. The counter is never reset, so after the first session "no advertisement in *this* session" has to be tested against a value recorded at session start (`ResetPowerControl()` and `StartColdStartRamp()` do this), not against zero.
 - **Freshness.** An unchanged count between two control decisions means no new telemetry arrived, so the previous decision has not been observed yet. The power control loop skips such cycles rather than acting on a stale PGOOD (§6.3).
 
 ### 5.3 Advertisement Parsing
@@ -501,7 +503,7 @@ StateCharging
   │ Entry: mWptManager.EnableWpt()
   │ WPT_POWER_ON: no-op (already active)
   │ WPT_POWER_OFF → StateIdle (calls mWptManager.DisableWpt())
-  │ WPT_SLOW_CHARGE: mWptManager.StartColdStartEscalation()
+  │ WPT_SLOW_CHARGE: mWptManager.StartColdStartRamp()
   │ WPT_ADJUST_POWER: mWptManager.AdjustWptPowerTransfer(step)
   │ WPT_BATTERY_CHARGED: no-op (handled by app layer — see §6.4)
   │ WPT_SCAN_TIMEOUT: → WPT_POWER_OFF
@@ -524,18 +526,20 @@ StateTest (stub — Entry and DispatchEvent log only, no behavior)
 `WptManager` is the singleton that owns the LTC4125 and DAC directly.
 
 **`EnableWpt()`:**
-1. Sets `WPT_EN` LOW (active-low: enables LTC4125) — **only if the pause mask is clear**
+1. Writes `m_level` to the DAC, then sets `WPT_EN` LOW (active-low: enables LTC4125) — **only if the pause mask is clear**
 2. Starts the 5-second status timeout timer
 3. Starts the status monitoring timer (500 ms periodic)
 
 The mask check in step 1 matters because `Entry()` re-runs on the `StateSlowCharge → StateCharging` transition. Without it, a `WPT_POWER_ON` arriving during an active thermal or OVP pause would turn the coil back on underneath that pause. A fault outranks a state entry.
 
+Writing the level first matters because `DisableWpt()` never touches the DAC: without it, a new session's coil came on at whatever level the previous session ended on until the first `WPT_ADJUST_POWER` was handled. On the `StateSlowCharge → StateCharging` re-entry the write repeats the current level and changes nothing.
+
 **`DisableWpt()`:**
 1. Sets `WPT_EN` HIGH (active-low: disables LTC4125)
 2. Stops the status monitoring timer
 3. Stops both monitoring timers (fault and power control)
-4. Stops the cold-start escalation timer
-5. Calls `ResetPowerControl()` — clears the pause mask, both pause tick counters, the level, the floor/ceiling bounds, and the loop-initialized flag
+4. Stops the cold-start ramp timer
+5. Calls `ResetPowerControl()` — clears the pause mask, both pause tick counters, the level (back to step 1), the floor/ceiling bounds, and the loop-initialized flag, and records the current advertisement count as the session's baseline
 
 Step 5 is what makes a charge session start clean. An earlier revision left the thermal flag as a static that survived across sessions, so a session that ended while paused would leave it set and the next session's first cool reading would fire a spurious resume.
 
@@ -557,7 +561,7 @@ static uint8_t m_pause_reasons;   // coil enabled iff == 0
 
 **Coil state tracking — `m_coil_enabled` / `IsCoilEnabled()`.** The mask alone cannot say whether the coil is being driven: in WPT `StateIdle` the mask is zero *and* the coil is off. `m_coil_enabled` records the actual drive state. It is set wherever `WptHalInstance.Enable()` really runs — `EnableWpt()` on its unmasked branch, and `ResumeWpt()` when the mask reaches zero — and cleared in `DisableWpt()` and on the first `PauseWpt()`.
 
-**Monitoring timer entry points.** `StartIpgTemperaturePgoodMonitoringTimer()` starts both the fault timer and the power-control timer (§6.3). `StartFaultMonitoringOnly()` starts only the fault timer; manual mode uses it so thresholds are still evaluated while the titration loop never runs. In debug builds `EnterManualIdle()` combines what manual mode needs on entry — `DisableWpt()` then `StartFaultMonitoringOnly()` — and runs on the WPT task via `WPT_MANUAL_IDLE` (§4.7). There is a single stop, `StopIpgTemperaturePgoodMonitoringTimer()`, which stops both.
+**Monitoring timer entry points.** `StartIpgTemperaturePgoodMonitoringTimer()` stops the cold-start ramp and starts both the fault timer and the power-control timer (§6.3). `StartFaultMonitoringOnly()` starts only the fault timer; manual mode uses it so thresholds are still evaluated while the titration loop never runs. In debug builds `EnterManualIdle()` combines what manual mode needs on entry — `DisableWpt()` then `StartFaultMonitoringOnly()` — and runs on the WPT task via `WPT_MANUAL_IDLE` (§4.7). There is a single stop, `StopIpgTemperaturePgoodMonitoringTimer()`, which stops both.
 
 **Accessors for the debug console.** `SetPowerLevelManual()` routes through `SetPowerLevel()`, so `m_level` stays the single source of truth. Alongside it: `GetPowerLevel()`, `GetMaxPowerLevel()`, `GetPauseReasons()`, `GetOvpCeiling()`, `GetPgoodFloor()`, `IsFloorFound()`, and `IsCoilEnabled()` — the last read only by the console's status dump. `RearmPowerSearch()` clears `m_floor_found` while keeping the observed bounds; it currently has **no callers**. It was written for an exit-to-automatic handover that was replaced by a full shutdown on exit, and is kept in case that handover is wanted.
 
@@ -568,7 +572,7 @@ voltage_mV = 400 + (step × 100)
 dac_code   = voltage_mV × 65536 / (gain × VREF)
            = voltage_mV × 65536 / (2 × 2500)     ← gain is 2, see §2.2
 ```
-to DAC CHANNEL_1 and latches via `LDAC`. Step 12 → 1600 mV → dac_code 20971. Steps above the maximum are clamped to `VoltageMaxPulseWidthThreshold_mV` by the HAL (`hal_wpt.cpp:106-109`), which is what lets the cold-start path request "maximum" with a deliberately out-of-range constant.
+to DAC CHANNEL_1 and latches via `LDAC`. Step 12 → 1600 mV → dac_code 20971. Steps above the maximum are clamped to `VoltageMaxPulseWidthThreshold_mV` by the HAL (`hal_wpt.cpp:106-109`), which is what makes the deliberately out-of-range `LEVEL_REQUEST_MAX` constant safe (it has no callers since the cold-start escalation was removed).
 
 `WptManager::SetPowerLevel()` normalizes before recording, so `m_level` always names a real step and never the out-of-range max request.
 
@@ -600,7 +604,7 @@ Every automatic path starts and stops them together through `StartIpgTemperature
 | PGOOD = 1, floor not yet found | Possibly overpowered | Down one step |
 | PGOOD = 1, floor found | At the minimum viable level | Hold |
 
-The loop starts at `COLD_START_LEVEL` (step 7) on the first cycle with real telemetry, wherever the open-loop cold-start attempt happened to leave the level. Because the error is correctly signed in every case, there is no reset-and-restart path, and every correction is a single 100 mV step.
+The loop starts from the level already in force: wherever the cold-start ramp stopped, or step 1 when the IPG was found in `StateScan`. The first cycle with real telemetry only marks the loop initialized and waits one more cycle. Until 2026-09-17 that cycle set step 7, a jump of up to six steps that is now avoided for the same reason as the ramp (§4.5). Because the error is correctly signed in every case, there is no reset-and-restart path, and every correction is a single 100 mV step.
 
 Three guards run before any rule is evaluated:
 
@@ -612,7 +616,7 @@ if (adv_count == m_last_adv_count) return;   // stale telemetry, or cold start
 
 The first is what makes PGOOD interpretable at all. Because the control loop bails out whenever any fault is asserted, every PGOOD = 0 it actually observes has no fault behind it — so it unambiguously means "too little power," and stepping up is correct. Faults only ever step down, and only from the 2 s path. See §6.6 for why this separation is necessary rather than merely tidy.
 
-The third guard also cleanly gates the loop off during cold start, since the advertisement count stays at zero until the IPG answers.
+The third guard also cleanly gates the loop off during cold start, since the advertisement count stays at the session baseline recorded by `ResetPowerControl()` until the IPG answers. (Before 2026-09-17 the baseline was 0, so in every session after the first the previous session's last advertisement looked fresh.)
 
 #### Floor, ceiling, and the empty window
 
@@ -633,12 +637,12 @@ Once the floor is found the level only ratchets **up**, so the loop does not hun
 
 #### Timing expectations
 
-Descending from step 7 takes up to 7 steps at 10 s each, plus 20 s to confirm the insufficiency at the bottom — roughly 1–2 minutes before the loop reaches `HOLD` in the typical case. A short bench test may never reach steady state; that is not a malfunction.
+The loop now usually starts low and climbs: each step up needs two PGOOD = 0 cycles, so about 20 s per step (e.g. step 1 → 5 in about 80 s). The first confirmed insufficiency sets `m_floor_found`, so once PGOOD rises the loop holds there — the lowest viable level, reached from below. If the start level already gives PGOOD = 1, the loop descends at 10 s per step instead until PGOOD drops. A short bench test may never reach steady state; that is not a malfunction.
 
 **Key constants:**
 
 ```cpp
-COLD_START_LEVEL          = 7    // of 0..12 — where the closed loop begins
+COLD_START_LEVEL          = 1    // of 0..12 — reset level and cold-start ramp start
 PGOOD_LOW_CONFIRM         = 2    // consecutive PGOOD=0 cycles before stepping up
 BLANK_CYCLES_AFTER_FAULT  = 1    // control cycles skipped after a fault resume
 MIN_POWER_LEVEL           = 0
@@ -896,7 +900,7 @@ Seven conditional gates collapsed to two:
 | `StateCharge` `WPT_SCAN_TIMEOUT` | no such case |
 | `StateSlowChargeAndScan` power-off (the missed one) | not in that state |
 | `PowerControlMonitoring` | `mPowerCtrlTimer` is never started |
-| `StartColdStartEscalation` / `ColdStartEscalate` | never started in manual mode; one left pending by the previous state is cancelled on entry (`EnterManualIdle()`) |
+| `StartColdStartRamp` / `ColdStartRampStep` (were `StartColdStartEscalation` / `ColdStartEscalate`) | never started in manual mode; a ramp left running by the previous state is cancelled on entry (`EnterManualIdle()`) |
 | `IpgTemperatureMonitoring` warn-only | **kept** — the monitor must run and report |
 | `IpgOvpMonitoring` warn-only | **kept** — same |
 
@@ -1049,6 +1053,28 @@ This also resolves the §11 note about `state_slow_charge_and_scan.cpp:29` ("a l
 
 **Not done — keep-alive level during a pause.** Instead of turning the coil off, drop to a level at which the IPG stays powered with PGOOD = 0 (many such advertisements appear in the logs), so it keeps reporting temperature and the blind period disappears. The coil itself heats the implant, so this needs bench thermal measurements first.
 
+### 8.9 — 2026-09-17 Cold-start ramp from step 1
+
+**Reason.** Jumping straight to step 7 at cold start occasionally caused physical damage to the IPG's rectifier.
+
+**Change.** Cold start now begins at step 1 and rises one step every 30 s until the IPG advertises or step 12 is reached (§4.5). The closed loop keeps whatever level it inherits instead of forcing step 7 (§6.3).
+
+| File | Change |
+|------|--------|
+| `svc_wpt_manager.h` | `COLD_START_LEVEL` 7 → 1. `COLD_START_ESCALATE_MS` and `COLD_START_ESCALATION_ENABLED` replaced by `COLD_START_STEP_MS` = 30,000. `StartColdStartEscalation()` / `ColdStartEscalate()` / `mColdStartEscalateTimer` renamed to `StartColdStartRamp()` / `ColdStartRampStep()` / `mColdStartRampTimer`. New `m_cold_start_adv_count` |
+| `svc_wpt_manager.cpp` | Periodic ramp timer and step logic. `EnableWpt()` writes `m_level` to the DAC before enabling. `StartIpgTemperaturePgoodMonitoringTimer()` stops the ramp. The first control cycle no longer sets step 7. `ResetPowerControl()` records the current advertisement count instead of 0 |
+| `svc_wpt_state_charging.cpp` | `WPT_SLOW_CHARGE` calls `StartColdStartRamp()` |
+| `svc_ble_manager.h` | `SCAN_TIMEOUT_SLOW_CHARGE_MS` 30,000 → 390,000 ms |
+| `eda_timer.cpp` | `Start(period)` / `StartFromISR(period)` convert ms to ticks with `pdMS_TO_TICKS()` |
+
+**Latent bugs fixed along the way** (each would have undermined the ramp):
+
+1. *Coil started at the previous session's level.* `DisableWpt()` leaves the DAC alone, and `EnableWpt()` enabled the LTC4125 before the cold-start level was written.
+2. *Advertisement counter compared against 0.* The counter runs from boot. In any session after the first, `ColdStartEscalate()` always saw "advertising" and `PowerControlMonitoring()` treated the previous session's last advertisement as fresh — forcing step 7 within 10 s of cold start.
+3. *Timer periods passed as ticks.* At 1024 Hz every `Start(period)` window was about 2.3 % short, which would have cut the final 30 s hold at step 12 to about 21 s.
+
+**Status.** Syntax-checked (no errors in first-party code). Not hardware-tested.
+
 ## 9. Event Flow — Complete Happy Path
 
 ### 9.1 IPG already advertising (awake)
@@ -1081,7 +1107,7 @@ Every 2 s (mFaultTimer): IpgOvpMonitoring() + IpgTemperatureMonitoring()
 
 Every 10 s (mPowerCtrlTimer): PowerControlMonitoring()
   → skipped while any fault is pending, blanked, or telemetry is stale
-  → first cycle with telemetry: set step 7
+  → first cycle with telemetry: keep the current level, decide next cycle
   → PGOOD=1, floor not found: step down
   → PGOOD=1, floor found:     hold
   → PGOOD=0 twice running:    step up, record pgood_floor, floor found
@@ -1102,14 +1128,13 @@ User presses button
 No IPG found — BLE_SCAN_TIMEOUT fires
   → StateScan → StateSlowChargeAndScan
   → StateSlowChargeAndScan::Entry():
-      SetScanTimeout(30 s)
+      SetScanTimeout(390 s)
       BlePort::START_SCANNING
-      WptPort::WPT_SLOW_CHARGE     ← cold start: LTC4125 at step 7
+      WptPort::WPT_SLOW_CHARGE     ← cold start: LTC4125 at step 1, ramp timer started
       white LED on
 
-Only if COLD_START_ESCALATION_ENABLED (off by default):
-After COLD_START_ESCALATE_MS with no advertisement
-  → ColdStartEscalate(): LTC4125 to maximum power for the rest of the window
+Every 30 s with no advertisement
+  → ColdStartRampStep(): LTC4125 one step higher (stops at step 12)
 
 WPT powers IPG; IPG boots, starts advertising
   → BleManager receives advertisement
@@ -1121,10 +1146,10 @@ WPT powers IPG; IPG boots, starts advertising
   → StateCharge::Entry():
       PMC_POWER_ON (no-op — PMC already in PmcStateEnable), yellow LED
       WptPort::WPT_POWER_ON       ← transitions WPT SM from any state to StateCharging
-      StartIpgTemperaturePgoodMonitoringTimer()
+      StartIpgTemperaturePgoodMonitoringTimer()   ← also stops the ramp
 
 First 10 s control cycle with telemetry
-  → level snaps to step 7 if escalation moved it; closed loop takes over from the open-loop cold start
+  → level kept where the ramp stopped; closed loop takes over one step at a time
 
 ... charging proceeds as normal ...
 ```
@@ -1146,8 +1171,8 @@ Operator presses 'm' over RTT
       WptPort::WPT_MANUAL_IDLE       ← processed after the previous state's WPT events
       magenta LED
   → WPT task, EnterManualIdle():
-      DisableWpt()                   ← coil off, timers stopped, escalation cancelled,
-                                       level → step 7
+      DisableWpt()                   ← coil off, timers stopped, ramp cancelled,
+                                       level → step 1
       StartFaultMonitoringOnly()     ← fault timer only; no titration, no cold start
       WPT SM → StateIdle             ← coil off until 's'
 
@@ -1198,7 +1223,7 @@ Operator presses 'n'
 SCAN_INTERVAL              = 0x00A0
 SCAN_WINDOW                = 0x0050
 SCAN_TIMEOUT_MS            = 10000     // ms — StateScan and StateCharge
-SCAN_TIMEOUT_SLOW_CHARGE_MS = 30000   // ms — StateSlowChargeAndScan
+SCAN_TIMEOUT_SLOW_CHARGE_MS = 390000  // ms — StateSlowChargeAndScan; 12 ramp steps + 1 held at max
 CARSS_COMPANY_ID           = 0xF0F0   // Production IPG company ID
 ```
 
@@ -1207,8 +1232,7 @@ CARSS_COMPANY_ID           = 0xF0F0   // Production IPG company ID
 // Timers
 FAULT_MONITOR_PERIOD_MS        = 2000     // ms — temperature + OVP sampling
 POWER_CTRL_PERIOD_MS           = 10000    // ms — power search step interval
-COLD_START_ESCALATE_MS         = 30000    // ms — step 7 → maximum, open loop (only if enabled below)
-COLD_START_ESCALATION_ENABLED  = false    // jump to max during cold start; needs ESCALATE_MS < SCAN_TIMEOUT_SLOW_CHARGE_MS
+COLD_START_STEP_MS             = 30000    // ms — cold-start ramp: time at each level before +1 step
 
 // Thermal (single hysteresis band + dwell)
 IPG_TEMP_THRESHOLD_PAUSE       = 41       // °C — pause at/above
@@ -1224,9 +1248,9 @@ OVP_PAUSE_MIN_TICKS            = 5        // fault ticks (× 2 s) = 10 s dwell
 
 // Power search
 MIN_POWER_LEVEL                = 0        // PTH step
-COLD_START_LEVEL               = 7        // PTH step — cold start and loop entry
+COLD_START_LEVEL               = 1        // PTH step — reset level and cold-start ramp start
 LEVEL_INVALID                  = 0xFF     // sentinel: no bound observed yet
-LEVEL_REQUEST_MAX              = 0xFE     // out of range on purpose; HAL clamps
+LEVEL_REQUEST_MAX              = 0xFE     // out of range on purpose; HAL clamps (currently unused)
 PGOOD_LOW_CONFIRM              = 2        // consecutive PGOOD=0 cycles before stepping up
 BLANK_CYCLES_AFTER_FAULT       = 1        // control cycles skipped after a fault resume
 ```
@@ -1276,7 +1300,7 @@ WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idl
 
   So there is currently **no charger-side thermal limit of any kind**, and the value in the logs is a constant. Since the coil sits against the patient's skin during charging, a touch-temperature limit is normally a requirement rather than an enhancement (IEC 60601-1 §11.1) — and fixing the conversion is a prerequisite for implementing one. Two hardware facts also need confirming before trusting a corrected value: whether the NTC is the high- or low-side element in the divider (`hal_wpt.cpp:189` assumes low-side), and whether `VCC_mV = 5000` (`hal_adc.h:23`) matches what the SAADC actually sees, since the nRF52840 cannot take 5 V directly and there is presumably a divider ahead of AIN6.
 
-- **Cold start is open-loop:** Between 5 s and 10 s of the cold-start window the charger drives maximum PTH with no PGOOD or OVP telemetry to steer by. A drained IPG loads VRECT down hard, so OVP is unlikely — but this is the one window in which a fault could not be detected. Worth watching on a bench unit with VRECT instrumented.
+- **Cold start is open-loop and slow:** until the first advertisement the ramp raises power with no PGOOD or OVP telemetry to steer by. Because the ramp stops at the first advertisement, the level an IPG boots at is the most it sees blind — but that can still be step 12 for a poorly coupled IPG. A drained IPG that needs a high level can take up to 6 minutes to wake (390 s window), and a battery-powered IPG found in `StateScan` now climbs from step 1 at about 20 s per step. `SCAN_TIMEOUT_SLOW_CHARGE_MS` must be updated by hand if `COLD_START_LEVEL` or `COLD_START_STEP_MS` change.
 
 - **VCC_EN stays high after leaving `StateCharge`:** `StateCharge::Exit()` sends no `PMC_POWER_OFF` (§4.6), so after a completed charge or a button press the LTC4125 remains powered, though disabled, in `StateWait`.
 

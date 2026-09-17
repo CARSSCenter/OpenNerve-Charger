@@ -31,6 +31,7 @@ namespace svc
     uint8_t WptManager::m_pgood_low_count = 0;
     uint32_t WptManager::m_last_adv_count = 0;
     bool WptManager::m_loop_initialized = false;
+    uint32_t WptManager::m_cold_start_adv_count = 0;
     uint32_t WptManager::m_ovp_last_adv_count = 0;
     bool WptManager::m_chg1_ovp_logged = false;
     bool WptManager::m_chg2_ovp_logged = false;
@@ -63,7 +64,7 @@ namespace svc
 
     eda::Timer WptManager::mPowerCtrlTimer("WptPowerCtrl", POWER_CTRL_PERIOD_MS, 1, PowerControlMonitoring);
 
-    eda::Timer WptManager::mColdStartEscalateTimer("WptColdStart", COLD_START_ESCALATE_MS, 0, ColdStartEscalate);
+    eda::Timer WptManager::mColdStartRampTimer("WptColdStart", COLD_START_STEP_MS, 1, ColdStartRampStep);
 
     void WptManager::Init()
     {
@@ -130,6 +131,10 @@ namespace svc
         }
         else
         {
+            // Apply the recorded level first. DisableWpt() leaves the DAC where the
+            // last session put it, so enabling without this would briefly drive the
+            // coil at that level instead of m_level.
+            AdjustWptPowerTransfer(m_level);
             WptHalInstance.Enable();
             m_coil_enabled = true;
         }
@@ -145,7 +150,7 @@ namespace svc
         m_coil_enabled = false;
         StopStatusMonitoring();
         StopIpgTemperaturePgoodMonitoringTimer();
-        mColdStartEscalateTimer.Stop();
+        mColdStartRampTimer.Stop();
         ResetPowerControl();
         LOG_DEBUG("WPT Manager: DisableWpt\n");
     }
@@ -259,6 +264,8 @@ namespace svc
         // Fault sampling and power control run at different rates but share a
         // lifetime, so callers still start and stop them as one unit.
         LOG_DEBUG("WPT Manager: StartIpgTemperatureMonitoringTimer\n");
+        // The IPG has been found, so the closed loop takes the level from here.
+        mColdStartRampTimer.Stop();
         mFaultTimer.Start();
         mPowerCtrlTimer.Start();
     }
@@ -275,8 +282,8 @@ namespace svc
 #if WPT_MANUAL_DEBUG_MODE
     void WptManager::EnterManualIdle()
     {
-        // DisableWpt() posts the cold-start escalation timer's stop before it calls
-        // ResetPowerControl(). The timer task outranks this one, so an escalation
+        // DisableWpt() posts the cold-start ramp timer's stop before it calls
+        // ResetPowerControl(). The timer task outranks this one, so a ramp step
         // that had already expired runs before the reset rather than after it,
         // and the level still ends at COLD_START_LEVEL.
         DisableWpt();
@@ -292,35 +299,44 @@ namespace svc
         mPowerCtrlTimer.Stop();
     }
 
-    void WptManager::StartColdStartEscalation()
+    void WptManager::StartColdStartRamp()
     {
-        LOG_INFO("WPT Manager: Cold start at level %d, escalating to max in %d ms if no IPG advertisement\n",
-                 COLD_START_LEVEL, COLD_START_ESCALATE_MS);
+        m_cold_start_adv_count = svc::BleManager::GetAdvertisementCount();
+        LOG_INFO("WPT Manager: Cold start at level %d, stepping up every %d ms until an IPG advertisement\n",
+                 COLD_START_LEVEL, COLD_START_STEP_MS);
         SetPowerLevel(COLD_START_LEVEL);
-      if (COLD_START_ESCALATION_ENABLED)
-      {
-          LOG_INFO("WPT Manager: Cold start at level %d, escalating to max in %d ms if no IPG advertisement\n",
-                   COLD_START_LEVEL, COLD_START_ESCALATE_MS);
-          mColdStartEscalateTimer.Start();
-      } else
-      {
-          LOG_INFO("WPT Manager: Cold start at level %d, escalation disabled\n", COLD_START_LEVEL);
-      }
+        mColdStartRampTimer.Start();
     }
 
-    void WptManager::ColdStartEscalate(TimerHandle_t xTimer)
+    void WptManager::ColdStartRampStep(TimerHandle_t xTimer)
     {
-        // Self-guarding: if an advertisement arrived while this timer was pending,
-        // the closed loop now owns the power level and must not be overridden.
-        // That removes any need to cancel this timer on the BLE-found path.
-        if (svc::BleManager::GetAdvertisementCount() != 0)
+        // Self-guarding: if an advertisement arrived since the ramp started, the
+        // closed loop now owns the power level and must not be overridden.
+        if (svc::BleManager::GetAdvertisementCount() != m_cold_start_adv_count)
         {
-            LOG_INFO("WPT Manager: Cold start escalation skipped, IPG already advertising\n");
+            mColdStartRampTimer.Stop();
+            LOG_INFO("WPT Manager: Cold start ramp ended at level %d, IPG advertising\n", m_level);
             return;
         }
 
-        LOG_WARNING("WPT Manager: Cold start escalating to maximum power, still no IPG advertisement\n");
-        SetPowerLevel(LEVEL_REQUEST_MAX);
+        if (m_pause_reasons != 0)
+        {
+            LOG_WARNING("WPT Manager: Cold start ramp step skipped, fault mask 0x%02X owns the level\n",
+                        m_pause_reasons);
+            return;
+        }
+
+        if (m_level >= m_max_power_level)
+        {
+            mColdStartRampTimer.Stop();
+            LOG_WARNING("WPT Manager: Cold start ramp holding at maximum level %d, still no IPG advertisement\n",
+                        m_level);
+            return;
+        }
+
+        SetPowerLevel(m_level + 1);
+        LOG_WARNING("WPT Manager: Cold start ramp stepping up to level %d, no IPG advertisement yet (next step in %d ms)\n",
+                    m_level, COLD_START_STEP_MS);
     }
 
     bool WptManager::IsThermReadingPlausible(uint16_t get_therm_ref,
@@ -833,7 +849,11 @@ namespace svc
         m_pgood_floor = LEVEL_INVALID;
         m_blank_cycles = 0;
         m_pgood_low_count = 0;
-        m_last_adv_count = 0;
+        // The advertisement counter runs from boot, so a later session must compare
+        // against its current value: resetting to 0 would make the previous
+        // session's last advertisement look fresh.
+        m_last_adv_count = svc::BleManager::GetAdvertisementCount();
+        m_cold_start_adv_count = m_last_adv_count;
         m_loop_initialized = false;
         // Forget the logged battery OVP state so a flag still asserted when the
         // next session starts is reported again there.
@@ -902,8 +922,8 @@ namespace svc
         const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
 
         // No fresh telemetry since the last decision, so the last change has not
-        // been observed yet. Also covers cold start, where the count stays 0 and
-        // the open-loop escalation owns the level instead.
+        // been observed yet. Also covers cold start, where the count is unchanged
+        // and the open-loop ramp owns the level instead.
         if (adv_count == m_last_adv_count)
         {
             LOG_WARNING("WPT Manager: Power control skipped, no new IPG advertisement since last step\n");
@@ -912,13 +932,14 @@ namespace svc
 
         m_last_adv_count = adv_count;
 
-        // First cycle with real telemetry: take the level back to the mid-range
-        // start, wherever the open-loop cold-start attempt happened to leave it.
+        // First cycle with real telemetry: keep the level the cold-start ramp
+        // reached (jumping to a fixed mid-range level can damage the IPG's
+        // rectifier) and wait one cycle before the first decision. From here PGOOD
+        // moves the level one step at a time in either direction.
         if (!m_loop_initialized)
         {
             m_loop_initialized = true;
-            SetPowerLevel(COLD_START_LEVEL);
-            LOG_INFO("WPT Manager: Closed loop starting at level %d\n", m_level);
+            LOG_INFO("WPT Manager: Closed loop starting at level %d (cold-start level kept)\n", m_level);
             return;
         }
 

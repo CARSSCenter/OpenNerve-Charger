@@ -64,7 +64,7 @@ namespace svc
         case WptPort::Event_e::WPT_MANUAL_IDLE:
         {
             // Already idle, but the previous application state may have left
-            // monitoring timers or a cold-start escalation running.
+            // monitoring timers or a cold-start ramp running.
             mWptManager.EnterManualIdle();
             break;
         }

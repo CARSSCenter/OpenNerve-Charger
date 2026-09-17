@@ -109,7 +109,7 @@ namespace svc
 
 #if WPT_MANUAL_DEBUG_MODE
         /// Establishes manual mode's idle baseline: coil off, every WPT timer
-        /// stopped, any pending cold-start escalation cancelled, power search reset,
+        /// stopped, any running cold-start ramp cancelled, power search reset,
         /// then fault monitoring restarted on its own.
         ///
         /// Must run on the WPT task, dispatched from WPT_MANUAL_IDLE. The SYSTEM task
@@ -122,10 +122,10 @@ namespace svc
         /// Stops the IPG temp and PGOOD status timer.
         void StopIpgTemperaturePgoodMonitoringTimer();
 
-        /// Begins the open-loop cold-start attempt: drives COLD_START_LEVEL now and
-        /// escalates to maximum power after COLD_START_ESCALATE_MS if no IPG
-        /// advertisement has been seen by then.
-        void StartColdStartEscalation();
+        /// Begins the open-loop cold-start ramp: drives COLD_START_LEVEL now and
+        /// steps up one level every COLD_START_STEP_MS until an IPG advertisement
+        /// arrives or the maximum level is reached.
+        void StartColdStartRamp();
 
         /// Set Wpt power Transfer pulse width
         void AdjustWptPowerTransfer(uint8_t step);
@@ -245,10 +245,12 @@ namespace svc
         // Sentinel for "no bound observed yet". Not a reachable power level.
         static constexpr uint8_t LEVEL_INVALID = 0xFF;
 
-        // Where the closed loop starts once BLE telemetry is available, and where
-        // the open-loop cold-start attempt begins. Mid-range: high enough to wake a
-        // drained IPG, low enough not to drive VRECT straight into OVP.
-        static constexpr uint8_t COLD_START_LEVEL = 7;
+        // Level the coil is reset to and where the open-loop cold-start ramp
+        // begins. Kept low on purpose: jumping straight to a mid-range level (7)
+        // has occasionally damaged the IPG's rectifier, so power is brought up one
+        // step at a time instead. The closed loop starts from wherever the ramp
+        // stopped rather than from a fixed level.
+        static constexpr uint8_t COLD_START_LEVEL = 1;
 
         // Passed to SetPulseWidthThresholdStep() to request maximum power. Out of
         // range on purpose - the HAL clamps anything above the maximum step to
@@ -266,14 +268,11 @@ namespace svc
         // would drive us straight back into the fault.
         static constexpr uint8_t BLANK_CYCLES_AFTER_FAULT = 1;
 
-        // How long the cold-start attempt stays at COLD_START_LEVEL before
-        // escalating to maximum power for the rest of the scan window.
-        static constexpr uint32_t COLD_START_ESCALATE_MS = 30000;
-
-        // Cold start: true  = if no IPG advertisement after COLD_START_ESCALATE_MS at
-        // COLD_START_LEVEL, jump to maximum power.
-        //false = stay at COLD_START_LEVEL for the whole white-light window.
-        static constexpr bool COLD_START_ESCALATION_ENABLED = false;
+        // Time the cold-start ramp spends at each level before stepping up by one.
+        // SCAN_TIMEOUT_SLOW_CHARGE_MS (svc_ble_manager.h) is sized from this and
+        // COLD_START_LEVEL so the ramp can reach the maximum level and hold it for
+        // one step before the white-light window ends.
+        static constexpr uint32_t COLD_START_STEP_MS = 30000;
 
         /// Construct WptManager
         WptManager();
@@ -302,11 +301,12 @@ namespace svc
         /// @param xTimer Handle to the timer
         static void PowerControlMonitoring(TimerHandle_t xTimer);
 
-        /// Callback for the cold-start escalation timer: raises power to maximum
-        /// if no IPG advertisement has been seen yet.
+        /// Callback for the periodic cold-start ramp timer: raises power by one
+        /// level if no IPG advertisement has arrived since the ramp started, and
+        /// stops the timer once one has or the maximum level is reached.
         ///
         /// @param xTimer Handle to the timer
-        static void ColdStartEscalate(TimerHandle_t xTimer);
+        static void ColdStartRampStep(TimerHandle_t xTimer);
 
         /// This method configures the GPIOs.
         void ConfigureGpios();
@@ -361,7 +361,7 @@ namespace svc
 
         static eda::Timer mPowerCtrlTimer;
 
-        static eda::Timer mColdStartEscalateTimer;
+        static eda::Timer mColdStartRampTimer;
 
         hal::Dac80504 DacHalInstance;
 
@@ -401,9 +401,14 @@ namespace svc
         // cycle when no fresh IPG telemetry has arrived since the last decision.
         static uint32_t m_last_adv_count;
 
-        // False until the first control cycle with real BLE data, which forces the
-        // level to COLD_START_LEVEL regardless of where cold start left it.
+        // False until the first control cycle with real BLE data. That cycle keeps
+        // the level the cold-start ramp reached and only waits one cycle before the
+        // first decision - it never jumps the level.
         static bool m_loop_initialized;
+
+        // Advertisement counter when the cold-start ramp started. The counter runs
+        // from boot, so "no advertisement yet" means unchanged from this, not zero.
+        static uint32_t m_cold_start_adv_count;
 
         // Advertisement counter when the current thermal / OVP pause started (or
         // the last blind retry ended). Unchanged while paused = the IPG is dark.
