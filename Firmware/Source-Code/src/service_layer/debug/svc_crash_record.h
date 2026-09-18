@@ -50,9 +50,10 @@ namespace svc
         /// Logs the reset reason and any stored crash record, then paints the
         /// unused main stack so LogStackHeadroom() can measure it.
         ///
-        /// Call once from System::Init(), after the log backend is up and before
-        /// the SoftDevice is enabled: RESETREAS is read and cleared directly,
-        /// which is only permitted while the SoftDevice is disabled.
+        /// Call once from System::Init(), after the log backend is up. Safe either
+        /// side of SoftDevice enable: RESETREAS is read directly while it is off
+        /// and through sd_power_reset_reason_get() once it is on. Calling it
+        /// early is still preferable, so a crash report leads the log.
         static void ReportAtBoot();
 
         /// Remembers how far the heartbeat had got, so a crash report can say how

@@ -1101,6 +1101,44 @@ This also resolves the §11 note about `state_slow_charge_and_scan.cpp:29` ("a l
 
 **Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states (54 first-party files, 0 errors, only the pre-existing NULL-conversion warnings). Not hardware-tested.
 
+### 8.11 — 2026-09-18 Debug port re-locking on revision-3 silicon: the real "only a re-flash fixes it"
+
+**Symptom.** After unplugging everything overnight and plugging back in, the charger showed no RTT output and no coil output on a button press. JLinkExe's connect log contained:
+
+```
+InitTarget() start
+Device will be unsecured now.
+```
+
+**Cause.** That message means SEGGER's nRF52 connect script found the debug port locked and unlocked it the only way it can — a CTRL-AP `ERASEALL`, which wipes flash, RAM and UICR. Reading `0x00027000` afterwards returned `FFFFFFFF`: the application was gone.
+
+The board's nRF52840 is revision 3 (`FICR.INFO.VARIANT` = `0x41414630`, "AAF0"; `0x10000130/134` = `0x08`/`0x05`). On that silicon the access-port protection re-arms after every reset unless firmware opens it again at each boot. The vendored MDK (8.40.3) has the routine for this, `nrf52_handle_approtect()`, but only the generic `system_nrf52.c` calls it; the project compiles `system_nrf52840.c`, which never does. So:
+
+1. Any reset the debugger did not start — power-on, brown-out, pin reset — locked the debug port. RTT went silent, though the firmware itself may still have been running.
+2. The next J-Link connection "unsecured" the chip, erasing it.
+3. Only then was the board genuinely dead, until re-flashed.
+
+This accounts for much of what §8.10 attributed to crashes: no fault text in any of the hangs, the header-only reconnect logs before every recovery, and power cycling never helping. Soft resets with the debugger attached (Button 2 mid-session) did not re-lock the port, which is why those kept RTT streaming.
+
+**Fix.** `keep_debug_port_open()` in `src/main.cpp`, the first call in `main()`, Debug builds only:
+
+| Step | When |
+|------|------|
+| Skip entirely unless `nrf52_errata_249()` (the SDK's revision check) is true | Every boot |
+| Write `UICR.APPROTECT = HwDisabled` (0x5A) through the NVMC, then reset — only while the register still reads erased, since UICR bits cannot return to 1 without an erase and a locked value would otherwise reset forever | Once after each flash |
+| Write `NRF_APPROTECT->DISABLE = SwDisable` (0x5A) | Every boot |
+
+Release builds compile the function out, so a production charger keeps its debug port locked (see §11).
+
+**Status.** Hardware-verified 2026-09-18: after a full unplug and replug, JLinkExe connected with no "unsecured" line (`InitTarget()` 2.27 ms, against 223 ms when it was erasing), the firmware had been running on its own before the debugger attached, and the boot line read `reset reason 0x00000000: POWER-ON or BROWN-OUT`.
+
+**Also changed.** The boot line now lists every `RESETREAS` bit rather than the first. The register accumulates until cleared, and the first boot of the §8.10 build reported `0x0000000C` as "software reset", hiding a CPU-lockup bit (bit 3) that had been set at some earlier point.
+
+**Recorder hardening (same day).** Two weaknesses found on review of `svc_crash_record.cpp`:
+
+- *A fault could escape the record.* The task name was read from the kernel's task control block before the record was committed. If the fault came from memory corruption, that block can itself be corrupt, and faulting again inside a fault handler locks the core up — no record, and with a debugger attached possibly a halt. The record is now committed first, from the fault's own data, and the name is read afterwards, only if the block lies in RAM (a name that still fails to read just leaves it blank). The stack-overflow hook checks its name pointer the same way.
+- *`ReportAtBoot()` depended on call order.* It read `NRF_POWER->RESETREAS` directly, which faults once the SoftDevice is enabled — a boot-time reset loop if `System::Init()` were ever reordered. It now uses `sd_power_reset_reason_get()` / `_clr()` when `nrf_sdh_is_enabled()`, and the register only while the SoftDevice is off.
+
 ---
 
 ## 9. Event Flow — Complete Happy Path
@@ -1251,7 +1289,7 @@ Fault (assert, APP_ERROR_CHECK, hard fault, stack overflow)
   → svc_crash_record: fill the .non_init record, one best-effort log line
   → NVIC_SystemReset()          ← the J-Link connection and RTT session survive this
   → next boot, before the SoftDevice is enabled:
-      "Boot N: reset reason 0x... (software reset)"
+      "Boot N: reset reason 0x00000004: SOFT-RESET"   (every set bit is listed)
       "CRASH RECORD: <type> in task '<name>', <n> heartbeats into the run"
       "  error <code> [<name>] at <file>:<line>"     (APP_ERROR_CHECK)
       "  pc 0x... lr 0x... psr 0x..."
@@ -1274,7 +1312,9 @@ Fault (assert, APP_ERROR_CHECK, hard fault, stack overflow)
 
 Map the addresses with `arm-none-eabi-addr2line -f -C -e <Output/.../hornet-wpt-charger.elf> <PC> <LR>`, or attach from SES (Debug → Attach Debugger, which neither resets nor downloads) and read the call stack. Then `r` and `g`: if the charger comes back, flash was never the problem and the earlier recoveries were just the debugger's reset.
 
-**Power is the other half.** The board runs from 3×AA, so unplugging a bench supply is not necessarily a power-on reset, and an attached J-Link can back-power the nRF. A genuine power cycle means supply off, cells out and the J-Link unplugged. `RESETREAS` reading 0 on the next boot is what confirms the supply was actually interrupted.
+**Reconnecting is safe now — in Debug builds.** Before §8.11, reconnecting the J-Link after any reset erased the chip. If JLinkExe ever prints `Device will be unsecured now` again, the chip has just been erased: stop and find out why the debug port was locked (a Release build, or a Debug build that never reached `main()`).
+
+**Read the boot line after any unexpected silence.** `0x00000000: POWER-ON or BROWN-OUT` in the middle of a session means the supply dipped — a power problem, not firmware. `CPU-LOCKUP` means a fault occurred inside a fault handler; the record from the first fault should still be there. `WATCHDOG`, `PIN` and `SOFT-RESET` name themselves. An attached J-Link can back-power the nRF, so a genuine power cycle means supply off and the J-Link unplugged.
 
 ---
 
@@ -1387,5 +1427,7 @@ configCHECK_FOR_STACK_OVERFLOW               = 2     // pattern check at every c
 - **A silent hang is still possible, and nothing resets the board:** the crash recorder (§8.10) only covers faults the CPU actually raises. A deadlock, a stuck interrupt or a busy-wait that never ends produces no fault, so the board still stops with no record. There is no watchdog — `NRFX_WDT_ENABLED` is 0 — and enabling one (paused while the debugger halts the core, fed from the heartbeat) would turn that last class of hang into a reset with `RESETREAS = DOG`.
 
 - **ISR-safe kernel calls are made from task context:** the WPT timer callbacks (`StatusTimeoutMonitoring`, `IpgTemperatureMonitoring`, `IpgOvpMonitoring`, `FailThermalProbe`) and `SetPowerLevel()` reach `Port::SendEventFromISR()`, which calls `xQueueSendFromISR` and `portYIELD_FROM_ISR` — but they run on the timer daemon task, not in an interrupt. It works today and the queue is protected either way, so this is hygiene rather than a defect. The related gap is that neither `SendEvent()` nor `SendEventFromISR()` checks its return value, so a full 20-deep queue drops events silently.
+
+- **Release builds lock the debug port — connecting a J-Link erases them:** on revision-3 nRF52840 silicon, `keep_debug_port_open()` (§8.11) runs in Debug builds only. That is deliberate for a production device, but it means attaching a J-Link to a Release unit for RTT will erase it. Conversely, a Debug build leaves `UICR.APPROTECT` open until the chip is erased, so a Debug build must never ship.
 
 - **`WptManager::RearmPowerSearch()` has no callers** (§6.2) — kept deliberately, but dead code today.

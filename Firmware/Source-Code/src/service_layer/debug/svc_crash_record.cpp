@@ -20,7 +20,9 @@
 #include "nrf_strerror.h"
 
 #ifdef SOFTDEVICE_PRESENT
+#include "nrf_sdh.h"
 #include "nrf_sdm.h"
+#include "nrf_soc.h"
 #endif
 
 #include <timers.h>
@@ -164,7 +166,17 @@ namespace
 
         TaskHandle_t const handle = xTaskGetCurrentTaskHandle();
 
-        return (handle != nullptr) ? pcTaskGetName(handle) : nullptr;
+        // The task control block may be exactly what got corrupted, and faulting
+        // again here - inside a fault handler - locks the core up. Only read the
+        // name if the whole block lies in RAM; a bad pointer that still lands in
+        // RAM just yields a garbled name, since CopyName() is length-bounded.
+        if ((handle == nullptr) ||
+            !IsReadable(reinterpret_cast<uint32_t>(handle), sizeof(StaticTask_t)))
+        {
+            return "?";
+        }
+
+        return pcTaskGetName(handle);
     }
 
     /// Opens a record, unless this boot already has one. Keeping the first fault
@@ -180,7 +192,8 @@ namespace
         memset(&m_record, 0, sizeof(m_record));
         m_record.type = type;
         m_record.heartbeat = (m_counters.magic == COUNTER_MAGIC) ? m_counters.heartbeat : 0u;
-        CopyName(m_record.task, TASK_LEN, CurrentTaskName());
+
+        // The task name is deliberately not read here - see CommitRecord().
 
         return true;
     }
@@ -193,6 +206,16 @@ namespace
         }
 
         m_record.magic = RECORD_MAGIC;
+
+        // Only now reach into the kernel for the task name. Everything read so
+        // far came from the fault itself; the task control block is the one
+        // thing that may be corrupt. The record is already valid, so if this
+        // read faults the next boot still reports the fault, just without a
+        // task name. (The stack-overflow hook supplies its own name first.)
+        if (m_record.task[0] == '\0')
+        {
+            CopyName(m_record.task, TASK_LEN, CurrentTaskName());
+        }
     }
 
     char const *TypeText(uint32_t type)
@@ -235,47 +258,48 @@ namespace
         }
     }
 
-    /// Names the first reset cause that is set. RESETREAS with no bits set means
-    /// the supply was interrupted - a power-on or brown-out reset - which is the
-    /// one case that also wipes the record.
-    char const *ResetReasonText(uint32_t reasons)
+    /// " <name>" when the bit is set, "" otherwise. RESETREAS can hold several
+    /// causes at once (it accumulates until cleared), so every bit is reported -
+    /// naming only the first hid a CPU lockup behind "software reset".
+    ///
+    /// Returns string literals only, which stay valid for deferred logging too.
+    char const *ReasonFlag(uint32_t reasons, uint32_t mask, char const *p_name)
     {
+        return ((reasons & mask) != 0u) ? p_name : "";
+    }
+
+    void LogResetReason(uint32_t boot, uint32_t reasons)
+    {
+        // No bits set means the supply was interrupted: a power-on or brown-out
+        // reset, the one case that also wipes the crash record.
         if (reasons == 0u)
         {
-            return "power-on or brown-out";
+            LOG_WARNING("Boot %d: reset reason 0x00000000: POWER-ON or BROWN-OUT\n", boot);
+            return;
         }
 
-        if ((reasons & POWER_RESETREAS_RESETPIN_Msk) != 0u)
+        LOG_WARNING("Boot %d: reset reason 0x%08X:%s%s%s%s\n",
+                    boot,
+                    reasons,
+                    ReasonFlag(reasons, POWER_RESETREAS_RESETPIN_Msk, " PIN"),
+                    ReasonFlag(reasons, POWER_RESETREAS_DOG_Msk, " WATCHDOG"),
+                    ReasonFlag(reasons, POWER_RESETREAS_SREQ_Msk, " SOFT-RESET"),
+                    ReasonFlag(reasons, POWER_RESETREAS_LOCKUP_Msk, " CPU-LOCKUP"));
+
+        // The wake-up sources, on a second line: NRF_LOG takes at most 6 arguments.
+        const uint32_t wake_mask = POWER_RESETREAS_OFF_Msk | POWER_RESETREAS_LPCOMP_Msk |
+                                   POWER_RESETREAS_DIF_Msk | POWER_RESETREAS_NFC_Msk |
+                                   POWER_RESETREAS_VBUS_Msk;
+
+        if ((reasons & wake_mask) != 0u)
         {
-            return "pin reset";
+            LOG_WARNING("  also:%s%s%s%s%s\n",
+                        ReasonFlag(reasons, POWER_RESETREAS_OFF_Msk, " WAKE-GPIO"),
+                        ReasonFlag(reasons, POWER_RESETREAS_LPCOMP_Msk, " WAKE-LPCOMP"),
+                        ReasonFlag(reasons, POWER_RESETREAS_DIF_Msk, " DEBUG-INTERFACE"),
+                        ReasonFlag(reasons, POWER_RESETREAS_NFC_Msk, " WAKE-NFC"),
+                        ReasonFlag(reasons, POWER_RESETREAS_VBUS_Msk, " WAKE-VBUS"));
         }
-
-        if ((reasons & POWER_RESETREAS_DOG_Msk) != 0u)
-        {
-            return "watchdog";
-        }
-
-        if ((reasons & POWER_RESETREAS_SREQ_Msk) != 0u)
-        {
-            return "software reset";
-        }
-
-        if ((reasons & POWER_RESETREAS_LOCKUP_Msk) != 0u)
-        {
-            return "CPU lockup";
-        }
-
-        if ((reasons & POWER_RESETREAS_OFF_Msk) != 0u)
-        {
-            return "wake from system OFF";
-        }
-
-        if ((reasons & POWER_RESETREAS_DIF_Msk) != 0u)
-        {
-            return "debug interface";
-        }
-
-        return "other";
     }
 
     void PaintMainStack()
@@ -341,8 +365,26 @@ namespace svc
     {
         // RESETREAS is sticky: clear the bits by writing them back, or every later
         // boot inherits this one's reasons.
-        const uint32_t reasons = NRF_POWER->RESETREAS;
-        NRF_POWER->RESETREAS = reasons;
+        //
+        // POWER is a restricted peripheral once the SoftDevice is enabled - a
+        // direct access then is an invalid-memory-access fault, and at boot that
+        // would mean a reset loop. System::Init() calls this before the BLE
+        // subsystem starts, but go through the SoftDevice when it is up rather
+        // than depend on that ordering.
+        uint32_t reasons = 0;
+
+#ifdef SOFTDEVICE_PRESENT
+        if (nrf_sdh_is_enabled())
+        {
+            (void)sd_power_reset_reason_get(&reasons);
+            (void)sd_power_reset_reason_clr(reasons);
+        }
+        else
+#endif
+        {
+            reasons = NRF_POWER->RESETREAS;
+            NRF_POWER->RESETREAS = reasons;
+        }
 
         if (m_counters.magic != COUNTER_MAGIC)
         {
@@ -354,8 +396,7 @@ namespace svc
         m_counters.boots++;
         m_counters.heartbeat = 0;
 
-        LOG_WARNING("Boot %d: reset reason 0x%08X (%s)\n",
-                    m_counters.boots, reasons, ResetReasonText(reasons));
+        LogResetReason(m_counters.boots, reasons);
 
         if (m_record.magic == RECORD_MAGIC)
         {
@@ -538,7 +579,10 @@ extern "C" void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskNa
 
     if (StartRecord(svc::CrashRecord::TYPE_STACK_OVERFLOW))
     {
-        CopyName(m_record.task, TASK_LEN, pcTaskName);
+        // The name lives in the overflowing task's own control block, so check
+        // it before reading - "?" still leaves CommitRecord() nothing to redo.
+        CopyName(m_record.task, TASK_LEN,
+                 IsReadable(reinterpret_cast<uint32_t>(pcTaskName), TASK_LEN) ? pcTaskName : "?");
         CommitRecord();
     }
 

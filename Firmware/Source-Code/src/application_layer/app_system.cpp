@@ -39,9 +39,9 @@ namespace app
     {
         eda::Manager::Initialize();
 
-        // Straight after the log backend and before the SoftDevice is enabled:
-        // RESETREAS may only be read and cleared while the SoftDevice is off, and
-        // a crash from the previous run should be the first thing in the log.
+        // Straight after the log backend, so a crash from the previous run is the
+        // first thing in the log. (Safe after SoftDevice enable too - it switches
+        // to the SoftDevice API for RESETREAS - but earlier is better.)
         svc::CrashRecord::ReportAtBoot();
 
         mSystemActiveObject.InitTask(eda::ActiveObjectPriorities_e::app, "SystemActiveObject");
