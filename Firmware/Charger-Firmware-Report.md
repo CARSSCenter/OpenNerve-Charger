@@ -1168,7 +1168,7 @@ Release builds compile the function out, so a production charger keeps its debug
 
 `m_thermal_pause_adv_count` and `m_ovp_pause_adv_count` are replaced by `m_thermal_last_adv_count`, `m_thermal_silent_ticks` and `m_ovp_silent_ticks`. If no advertisement arrives at all after the pause, silence equals time paused, so behaviour in the original §8.8 case is unchanged.
 
-**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not hardware-tested.
+**Status.** Bench-verified 2026-09-18 (~9.5 min session, drained IPG at BattB 3.1 V, seven thermal pauses). In every pause the IPG went quiet and the blind retry fired after exactly 15 silent ticks, one level lower; four retries were confirmed by a fresh ≤ 39 °C reading. One retry got no advertisement, re-paused and queued one step up, and the next fired after 30 silent ticks (the 60 s backoff) and was confirmed. A pause in which the IPG kept advertising resumed normally on a real 38.35 °C reading. The OVP half of the change was not exercised: no OVP pause occurred.
 
 ### 8.13 — 2026-09-18 IPG lost while charging normally: the level froze
 
@@ -1178,7 +1178,7 @@ Release builds compile the function out, so a production charger keeps its debug
 
 **Fix.** The silent-IPG ramp in `PowerControlMonitoring()` / new `SilentRampStep()` (§6.3): after 30 s of silence with no fault pending, step up one level open-loop per 30 s until the IPG advertises, capped below any known OVP ceiling, ending the session if it is still silent at the cap. New `SILENT_RAMP_CYCLES`, `m_silent_cycles`, `m_silent_ramp_active`, all reset by `ResetPowerControl()`.
 
-**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not hardware-tested.
+**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not yet exercised on hardware: in the 2026-09-18 bench session (§8.12) the IPG never went quiet outside a fault pause, so the ramp never engaged. Exercising it needs the IPG to drop out during normal charging, as in the level 1 → 2 case above.
 
 ---
 
@@ -1473,5 +1473,7 @@ configCHECK_FOR_STACK_OVERFLOW               = 2     // pattern check at every c
 - **ISR-safe kernel calls are made from task context:** the WPT timer callbacks (`StatusTimeoutMonitoring`, `IpgTemperatureMonitoring`, `IpgOvpMonitoring`, `FailThermalProbe`) and `SetPowerLevel()` reach `Port::SendEventFromISR()`, which calls `xQueueSendFromISR` and `portYIELD_FROM_ISR` — but they run on the timer daemon task, not in an interrupt. It works today and the queue is protected either way, so this is hygiene rather than a defect. The related gap is that neither `SendEvent()` nor `SendEventFromISR()` checks its return value, so a full 20-deep queue drops events silently.
 
 - **Release builds lock the debug port — connecting a J-Link erases them:** on revision-3 nRF52840 silicon, `keep_debug_port_open()` (§8.11) runs in Debug builds only. That is deliberate for a production device, but it means attaching a J-Link to a Release unit for RTT will erase it. Conversely, a Debug build leaves `UICR.APPROTECT` open until the chip is erased, so a Debug build must never ship.
+
+- **No thermal ceiling for the closed loop:** an OVP trip records `m_ovp_ceiling` and the loop never climbs back to it, but a thermal trip records nothing the loop respects (`m_thermal_trip_level` only bounds the blind retry's own step-ups). If PGOOD stays low below the level that overheats, the loop climbs back to it after each confirmed retry, giving a repeating pause / retry / climb cycle. Seen on the bench 2026-09-18: seven thermal pauses in ~9.5 min at levels 4–6 with PGOOD = 0 throughout (§8.12). Options if needed: a thermal ceiling analogous to the OVP one, or ending the session when PGOOD cannot be reached below the trip level.
 
 - **`WptManager::RearmPowerSearch()` has no callers** (§6.2) — kept deliberately, but dead code today.
