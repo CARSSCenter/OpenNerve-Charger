@@ -35,8 +35,11 @@ namespace svc
     uint32_t WptManager::m_ovp_last_adv_count = 0;
     bool WptManager::m_chg1_ovp_logged = false;
     bool WptManager::m_chg2_ovp_logged = false;
-    uint32_t WptManager::m_thermal_pause_adv_count = 0;
-    uint32_t WptManager::m_ovp_pause_adv_count = 0;
+    uint32_t WptManager::m_thermal_last_adv_count = 0;
+    uint16_t WptManager::m_thermal_silent_ticks = 0;
+    uint16_t WptManager::m_ovp_silent_ticks = 0;
+    uint8_t WptManager::m_silent_cycles = 0;
+    bool WptManager::m_silent_ramp_active = false;
     bool WptManager::m_thermal_probe_active = false;
     uint32_t WptManager::m_thermal_probe_adv_count = 0;
     uint16_t WptManager::m_thermal_probe_ticks = 0;
@@ -440,7 +443,8 @@ namespace svc
         m_thermal_retry_count++;
         m_thermal_probe_no_ad = no_ad;
         m_thermal_pause_ticks = 0;
-        m_thermal_pause_adv_count = adv_count;
+        m_thermal_last_adv_count = adv_count;
+        m_thermal_silent_ticks = 0;
 
         LOG_WARNING("WPT Manager: Blind thermal retry %d/%d failed (%s) at level %d, pausing again\n",
                     m_thermal_retry_count, THERMAL_BLIND_RETRY_MAX,
@@ -478,6 +482,18 @@ namespace svc
         if (thermally_paused)
         {
             m_thermal_pause_ticks++;
+
+            // Counted here, ahead of the plausibility check: an implausible
+            // reading still proves the IPG is alive and advertising.
+            if (adv_count != m_thermal_last_adv_count)
+            {
+                m_thermal_last_adv_count = adv_count;
+                m_thermal_silent_ticks = 0;
+            }
+            else
+            {
+                m_thermal_silent_ticks++;
+            }
         }
 
         // A blind retry is running: the stored reading is the stale one that caused
@@ -573,7 +589,8 @@ namespace svc
                           (int32_t)((ipg_temperature) * 100) % 100,
                           IPG_TEMP_THRESHOLD_PAUSE);
                 m_thermal_pause_ticks = 0;
-                m_thermal_pause_adv_count = adv_count;
+                m_thermal_last_adv_count = adv_count;
+                m_thermal_silent_ticks = 0;
                 m_thermal_probe_no_ad = false;
                 if (m_thermal_trip_level == LEVEL_INVALID)
                 {
@@ -597,9 +614,12 @@ namespace svc
 
         if (ipg_temperature > IPG_TEMP_THRESHOLD_RESUME)
         {
-            // No advertisement since the pause began: the IPG runs on coil power
-            // and went dark with the coil, so this reading can never improve.
-            if (adv_count != m_thermal_pause_adv_count)
+            // Still hot. While the IPG keeps advertising, wait for it to cool.
+            // Once it has gone quiet, the stored reading is frozen and can never
+            // improve: a coil-powered IPG went dark with the coil, possibly after
+            // a few advertisements on its own battery. The retry backoff below is
+            // measured in this silence too.
+            if (m_thermal_silent_ticks < THERMAL_BLIND_RETRY_BASE_TICKS)
             {
                 return;
             }
@@ -615,7 +635,7 @@ namespace svc
                 return;
             }
 
-            if (m_thermal_pause_ticks < (THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count))
+            if (m_thermal_silent_ticks < (THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count))
             {
                 return;
             }
@@ -635,8 +655,9 @@ namespace svc
             m_thermal_probe_adv_count = adv_count;
             m_thermal_probe_ticks = 0;
 
-            LOG_WARNING("WPT Manager: IPG silent for %d ticks in thermal pause, blind retry %d/%d at level %d\n",
-                        m_thermal_pause_ticks, m_thermal_retry_count + 1, THERMAL_BLIND_RETRY_MAX, m_level);
+            LOG_WARNING("WPT Manager: IPG silent for %d ticks (%d in thermal pause), blind retry %d/%d at level %d\n",
+                        m_thermal_silent_ticks, m_thermal_pause_ticks,
+                        m_thermal_retry_count + 1, THERMAL_BLIND_RETRY_MAX, m_level);
 
             WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_RESUME,
                                       static_cast<uint32_t>(PAUSE_THERMAL));
@@ -763,25 +784,27 @@ namespace svc
                       m_level, fault_level, m_ovp_ceiling);
 
             m_ovp_pause_ticks = 0;
-            m_ovp_pause_adv_count = adv_count;
+            m_ovp_silent_ticks = 0;
             WptPort::SendEventFromISR(WptPort::Event_e::WPT_FAULT_PAUSE,
                                       static_cast<uint32_t>(PAUSE_OVP));
             return;
         }
 
         m_ovp_pause_ticks++;
+        m_ovp_silent_ticks = fresh ? 0 : (m_ovp_silent_ticks + 1);
 
         if (m_ovp_pause_ticks < OVP_PAUSE_MIN_TICKS)
         {
             return;
         }
 
-        if (adv_count == m_ovp_pause_adv_count)
+        if (m_ovp_silent_ticks >= OVP_PAUSE_MIN_TICKS)
         {
-            // No advertisement since the pause: a coil-powered IPG went dark with
-            // the coil, so the stored VRECT_OVPn is stale and can never clear.
+            // No new advertisement for the whole hold: a coil-powered IPG went
+            // dark with the coil - perhaps after a last advertisement or two on
+            // its battery - so the stored VRECT_OVPn is stale and can never clear.
             LOG_WARNING("WPT Manager: IPG silent for %d ticks in OVP pause, treating fault as cleared\n",
-                        m_ovp_pause_ticks);
+                        m_ovp_silent_ticks);
         }
         else if (vrect_ovp)
         {
@@ -861,14 +884,17 @@ namespace svc
         m_chg2_ovp_logged = false;
         m_level_max_this_tick = COLD_START_LEVEL;
         m_level_max_last_tick = COLD_START_LEVEL;
-        m_thermal_pause_adv_count = 0;
-        m_ovp_pause_adv_count = 0;
+        m_thermal_last_adv_count = 0;
+        m_thermal_silent_ticks = 0;
+        m_ovp_silent_ticks = 0;
         m_thermal_probe_active = false;
         m_thermal_probe_adv_count = 0;
         m_thermal_probe_ticks = 0;
         m_thermal_retry_count = 0;
         m_thermal_trip_level = LEVEL_INVALID;
         m_thermal_probe_no_ad = false;
+        m_silent_cycles = 0;
+        m_silent_ramp_active = false;
 
         LOG_INFO("WPT Manager: Power control reset, level %d\n", m_level);
     }
@@ -895,6 +921,48 @@ namespace svc
                ((m_pgood_floor + 1) >= m_ovp_ceiling);
     }
 
+    void WptManager::SilentRampStep()
+    {
+        // Never ramp into a level that has already tripped the IPG's rectifier OVP.
+        uint8_t limit = m_max_power_level;
+
+        if ((m_ovp_ceiling != LEVEL_INVALID) && (m_ovp_ceiling > MIN_POWER_LEVEL) &&
+            (static_cast<uint8_t>(m_ovp_ceiling - 1) < limit))
+        {
+            limit = static_cast<uint8_t>(m_ovp_ceiling - 1);
+        }
+
+        if (!m_silent_ramp_active)
+        {
+            m_silent_ramp_active = true;
+
+            // The IPG was lost at this level, so it is not enough to run it. Record
+            // it as insufficient and end the downward search: once the IPG is
+            // back, the loop may hold or climb but will not walk back down into
+            // the level that lost it.
+            if ((m_pgood_floor == LEVEL_INVALID) || (m_level > m_pgood_floor))
+            {
+                m_pgood_floor = m_level;
+            }
+            m_floor_found = true;
+
+            LOG_WARNING("WPT Manager: IPG silent for %d s while charging, stepping up open-loop from level %d (limit %d)\n",
+                        SILENT_RAMP_CYCLES * POWER_CTRL_PERIOD_MS / 1000, m_level, limit);
+        }
+
+        if (m_level >= limit)
+        {
+            // Held at the limit for one more silent period and still nothing: the
+            // IPG is gone, not underpowered. Same path as a lost receiver.
+            LOG_ERROR("WPT Manager: IPG still silent at level %d (ramp limit), ending charge session", m_level);
+            WptPort::SendEventFromISR(WptPort::Event_e::WPT_SCAN_TIMEOUT, 0);
+            return;
+        }
+
+        SetPowerLevel(m_level + 1);
+        LOG_WARNING("WPT Manager: Silent-IPG ramp stepping up to level %d\n", m_level);
+    }
+
     void WptManager::PowerControlMonitoring(TimerHandle_t xTimer)
     {
         // Bidirectional search for the lowest PTH ceiling the IPG still accepts.
@@ -908,6 +976,9 @@ namespace svc
 
         if (m_pause_reasons != 0)
         {
+            // Silence during a pause is the pause's business (blind retry / OVP
+            // hold), so it must not carry over into the silent-IPG ramp.
+            m_silent_cycles = 0;
             LOG_DEBUG("WPT Manager: Power control skipped, fault mask 0x%02X owns the level\n", m_pause_reasons);
             return;
         }
@@ -922,15 +993,45 @@ namespace svc
         const uint32_t adv_count = svc::BleManager::GetAdvertisementCount();
 
         // No fresh telemetry since the last decision, so the last change has not
-        // been observed yet. Also covers cold start, where the count is unchanged
-        // and the open-loop ramp owns the level instead.
+        // been observed yet. Briefly, that just means waiting. Sustained, it means
+        // the IPG has gone dark - and with a coil-powered IPG the likeliest reason
+        // is that the level is too low to run it, which no amount of waiting fixes.
+        // (This timer never runs during cold start: every path that starts it
+        // stops the cold-start ramp first.)
         if (adv_count == m_last_adv_count)
         {
-            LOG_WARNING("WPT Manager: Power control skipped, no new IPG advertisement since last step\n");
+            // A blind thermal retry has its own 20 s probe timeout; let it decide.
+            if (m_thermal_probe_active)
+            {
+                LOG_WARNING("WPT Manager: Power control skipped, thermal retry probe waiting for the IPG\n");
+                return;
+            }
+
+            m_silent_cycles++;
+
+            if (m_silent_cycles < SILENT_RAMP_CYCLES)
+            {
+                LOG_WARNING("WPT Manager: Power control skipped, no new IPG advertisement (%d/%d)\n",
+                            m_silent_cycles, SILENT_RAMP_CYCLES);
+                return;
+            }
+
+            m_silent_cycles = 0;
+            SilentRampStep();
             return;
         }
 
         m_last_adv_count = adv_count;
+        m_silent_cycles = 0;
+
+        if (m_silent_ramp_active)
+        {
+            // Same handover as after cold start: keep the level that brought the
+            // IPG back and decide from the next advertisement, never jump.
+            m_silent_ramp_active = false;
+            LOG_INFO("WPT Manager: IPG advertising again, closed loop resumes at level %d\n", m_level);
+            return;
+        }
 
         // First cycle with real telemetry: keep the level the cold-start ramp
         // reached (jumping to a fixed mid-range level can damage the IPG's

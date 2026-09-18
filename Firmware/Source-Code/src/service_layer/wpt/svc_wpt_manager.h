@@ -225,10 +225,11 @@ namespace svc
 
         // Blind thermal retry. Below ~3.2 V the IPG runs on rectified coil power, so
         // a thermal pause switches it off and no fresh temperature can ever arrive to
-        // satisfy the resume threshold. When a pause sees no new advertisement, the
-        // coil is re-enabled one step lower after 30 s, 60 s, 120 s, 240 s (base <<
-        // failed retries) until the IPG reports again, and the session ends after
-        // THERMAL_BLIND_RETRY_MAX failures.
+        // satisfy the resume threshold. Once the IPG has been silent for 30 s, 60 s,
+        // 120 s, 240 s (base << failed retries, measured from its last
+        // advertisement), the coil is re-enabled one step lower until the IPG
+        // reports again, and the session ends after THERMAL_BLIND_RETRY_MAX
+        // failures.
         static constexpr uint16_t THERMAL_BLIND_RETRY_BASE_TICKS = 15; // 30 s
         static constexpr uint8_t THERMAL_BLIND_RETRY_MAX = 4;
 
@@ -268,6 +269,15 @@ namespace svc
         // would drive us straight back into the fault.
         static constexpr uint8_t BLANK_CYCLES_AFTER_FAULT = 1;
 
+        // Charging, no fault pause, and the IPG has gone quiet: after this many
+        // consecutive power-control cycles with no new advertisement (3 * 10 s =
+        // 30 s) the level is raised one step open-loop, then one more step per
+        // further 30 s of silence, until the IPG advertises again. A drained IPG
+        // runs on coil power, so a level too low to sustain it cuts off the very
+        // telemetry the closed loop needs before it will raise the level - without
+        // this the loop held that level forever (seen 2026-09-18 at level 2).
+        static constexpr uint8_t SILENT_RAMP_CYCLES = 3;
+
         // Time the cold-start ramp spends at each level before stepping up by one.
         // SCAN_TIMEOUT_SLOW_CHARGE_MS (svc_ble_manager.h) is sized from this and
         // COLD_START_LEVEL so the ramp can reach the maximum level and hold it for
@@ -300,6 +310,10 @@ namespace svc
         ///
         /// @param xTimer Handle to the timer
         static void PowerControlMonitoring(TimerHandle_t xTimer);
+
+        // One step of the silent-IPG ramp (SILENT_RAMP_CYCLES). Ends the session
+        // if the IPG is still silent at the highest level the ramp may use.
+        static void SilentRampStep();
 
         /// Callback for the periodic cold-start ramp timer: raises power by one
         /// level if no IPG advertisement has arrived since the ramp started, and
@@ -401,6 +415,11 @@ namespace svc
         // cycle when no fresh IPG telemetry has arrived since the last decision.
         static uint32_t m_last_adv_count;
 
+        // Consecutive power-control cycles with no new advertisement, and whether
+        // the silent-IPG ramp currently owns the level (see SILENT_RAMP_CYCLES).
+        static uint8_t m_silent_cycles;
+        static bool m_silent_ramp_active;
+
         // False until the first control cycle with real BLE data. That cycle keeps
         // the level the cold-start ramp reached and only waits one cycle before the
         // first decision - it never jumps the level.
@@ -410,10 +429,20 @@ namespace svc
         // from boot, so "no advertisement yet" means unchanged from this, not zero.
         static uint32_t m_cold_start_adv_count;
 
-        // Advertisement counter when the current thermal / OVP pause started (or
-        // the last blind retry ended). Unchanged while paused = the IPG is dark.
-        static uint32_t m_thermal_pause_adv_count;
-        static uint32_t m_ovp_pause_adv_count;
+        // Silence tracking during a pause. "The IPG is dark" means no NEW
+        // advertisement for a while - not "none since the pause began". A drained
+        // IPG can keep advertising on its battery for a minute after the coil
+        // stops (14 advertisements were seen on 2026-09-18), then go dark with a
+        // hot reading frozen in place; testing "none since the pause" read that as
+        // a live IPG still cooling and waited forever.
+        //
+        // m_thermal_last_adv_count is the advertisement count at the last change
+        // seen in a thermal pause; each *_silent_ticks counts fault-monitor ticks
+        // since the last new advertisement, reset to 0 on each one. The OVP path
+        // uses m_ovp_last_adv_count, which it already refreshes every tick.
+        static uint32_t m_thermal_last_adv_count;
+        static uint16_t m_thermal_silent_ticks;
+        static uint16_t m_ovp_silent_ticks;
 
         // Blind thermal retry state. While a probe is active the stored (stale)
         // temperature is ignored until a fresh advertisement arrives, and that first

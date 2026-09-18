@@ -611,12 +611,25 @@ Three guards run before any rule is evaluated:
 ```cpp
 if (m_pause_reasons != 0)          return;   // fault path owns the level
 if (m_blank_cycles) { m_blank_cycles--; return; }
-if (adv_count == m_last_adv_count) return;   // stale telemetry, or cold start
+if (adv_count == m_last_adv_count) { ...; return; }   // stale telemetry - see the silent-IPG ramp below
 ```
 
 The first is what makes PGOOD interpretable at all. Because the control loop bails out whenever any fault is asserted, every PGOOD = 0 it actually observes has no fault behind it — so it unambiguously means "too little power," and stepping up is correct. Faults only ever step down, and only from the 2 s path. See §6.6 for why this separation is necessary rather than merely tidy.
 
-The third guard also cleanly gates the loop off during cold start, since the advertisement count stays at the session baseline recorded by `ResetPowerControl()` until the IPG answers. (Before 2026-09-17 the baseline was 0, so in every session after the first the previous session's last advertisement looked fresh.)
+The third guard compares against the session baseline recorded by `ResetPowerControl()`. (Before 2026-09-17 the baseline was 0, so in every session after the first the previous session's last advertisement looked fresh.) The loop never runs during cold start: every path that starts `mPowerCtrlTimer` stops the cold-start ramp first.
+
+#### Silent-IPG ramp (2026-09-18)
+
+A stale cycle is normally just a wait. Sustained silence is different: a drained IPG runs on coil power, so a level too low to sustain it cuts off the very telemetry the loop needs before it will raise the level, and the loop used to hold that level forever. Now, with no fault pause active:
+
+| Condition | Action |
+|-----------|--------|
+| 1–2 consecutive cycles with no new advertisement | Skip; logs `Power control skipped, no new IPG advertisement (n/3)` |
+| 3 cycles (`SILENT_RAMP_CYCLES`, 30 s) | Record the current level as insufficient (`m_pgood_floor`, `m_floor_found`), then step up one level open-loop. Repeats every further 30 s of silence |
+| Silent at the ramp limit for another 30 s | `IPG still silent at level L (ramp limit), ending charge session`; `WPT_SCAN_TIMEOUT` — same path as the thermal give-up |
+| Advertisement returns | Keep the level, decide from the next advertisement (the cold-start handover) |
+
+The ramp limit is `m_ovp_ceiling - 1` when an OVP ceiling is known, otherwise the maximum level; it never moves more than one step at a time. It stands aside while a fault pause is active (the pause's own blind retry or OVP hold owns silence there) and while a blind thermal retry is waiting on its probe. Because the lost level is recorded as the PGOOD floor, the loop will afterwards hold or climb but not walk back down into it; a thermal trip still re-arms the downward search.
 
 #### Floor, ceiling, and the empty window
 
@@ -645,6 +658,7 @@ The loop now usually starts low and climbs: each step up needs two PGOOD = 0 cyc
 COLD_START_LEVEL          = 1    // of 0..12 — reset level and cold-start ramp start
 PGOOD_LOW_CONFIRM         = 2    // consecutive PGOOD=0 cycles before stepping up
 BLANK_CYCLES_AFTER_FAULT  = 1    // control cycles skipped after a fault resume
+SILENT_RAMP_CYCLES        = 3    // silent control cycles (30 s) before each open-loop step up
 MIN_POWER_LEVEL           = 0
 MAX_VOLTAGE_STEP          = 12   // maximum DAC step (from the HAL)
 ```
@@ -678,7 +692,7 @@ This loop acts on the **IPG's** temperature, broadcast over BLE — not the char
 | Paused, dwell < 30 s | Hold — no resume regardless of temperature |
 | Paused, dwell ≥ 30 s, temp > 39 °C (`IPG_TEMP_THRESHOLD_RESUME`) | Hold — keep waiting |
 | Paused, dwell ≥ 30 s **and** temp ≤ 39 °C | `WPT_FAULT_RESUME(PAUSE_THERMAL)` — coil re-enabled |
-| Paused, temp > 39 °C, **no new advertisement since the pause** | Blind retry after 30 / 60 / 120 / 240 s — see below |
+| Paused, temp > 39 °C, **no new advertisement for 30 s** (the IPG has gone quiet) | Blind retry after 30 / 60 / 120 / 240 s — see below |
 
 The dwell is counted in fault-timer ticks (`THERMAL_PAUSE_MIN_TICKS = 15` × 2 s). Both conditions are required: the dwell alone would allow re-enabling into an implant still sitting at the limit, producing a power-burst cycle rather than a controlled hold, while the threshold alone gave no guaranteed cool-down time.
 
@@ -703,11 +717,11 @@ Because every wrap is caught by construction, no debounce is needed: a single *p
 
 **Blind thermal retry — coil-powered IPG (2026-09-17).** Below ~3.2 V the IPG has no usable battery and runs directly from the rectified coil voltage. A thermal pause turns the coil off, the IPG shuts down, and no new advertisement can ever arrive; the stored reading is the one that caused the pause, so the resume branch above was unreachable and the charger sat paused until a button press (seen on hardware: 48.47 °C, then 0 advertisements). The 48 °C reading is treated as genuine throughout.
 
-"The IPG is dark" is decided from the advertisement counter, not the battery voltage (the last BattB is itself stale): `m_thermal_pause_adv_count` is recorded when the pause starts, and an unchanged count means nothing has been heard since. An IPG running on its battery keeps advertising while paused, never takes this path, and resumes only on a real ≤ 39 °C reading as before.
+"The IPG is dark" is decided from the advertisement counter, not the battery voltage (the last BattB is itself stale): `m_thermal_silent_ticks` counts fault ticks since the counter last changed, and resets to 0 on every new advertisement, implausible ones included. What matters is silence *now*, not whether anything arrived since the pause began: a drained IPG can keep advertising on its battery for a while after the coil stops and only then go dark, freezing a hot reading in place (§8.12). An IPG that keeps advertising while paused never builds up silence, never takes this path, and resumes only on a real ≤ 39 °C reading as before.
 
 | Step | Action |
 |------|--------|
-| Paused, dark, dwell ≥ `THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count` (30, 60, 120, 240 s) | Step down one level (unless the last retry failed for lack of an advertisement), clear `m_floor_found`, set `m_blank_cycles`, start a probe, `WPT_FAULT_RESUME(PAUSE_THERMAL)`. Logs `IPG silent for N ticks in thermal pause, blind retry k/4 at level L` |
+| Paused, dark, silence ≥ `THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count` (30, 60, 120, 240 s since the last advertisement) | Step down one level (unless the last retry failed for lack of an advertisement), clear `m_floor_found`, set `m_blank_cycles`, start a probe, `WPT_FAULT_RESUME(PAUSE_THERMAL)`. Logs `IPG silent for N ticks (M in thermal pause), blind retry k/4 at level L` |
 | Probe running, no new advertisement | The stale reading is ignored — it would otherwise re-pause on the next tick |
 | Probe running, no advertisement within 20 s (`THERMAL_PROBE_TIMEOUT_TICKS`) | Failed (`no advertisement`): the level was too low to boot the IPG. Re-pause and queue one step **up**, never above `m_thermal_trip_level` (the level that first tripped) |
 | Probe running, first fresh plausible reading **> 39 °C** | Failed (`still hot`): re-pause. The retry skipped the cool-down check, so the first real reading must meet the *resume* threshold, not just stay under 41 °C |
@@ -748,7 +762,7 @@ const bool chg2_ovp  = (p.GET_CHG2_OVP_ERR == 0);  // logged on change only
 | New advertisement, a `CHGx_OVP_ERRn` changed | Log it — WARNING on assert, INFO on clear, with level and PGOOD. Coil unaffected |
 | Same advertisement as last tick | Ignored — only fresh telemetry can report a new fault |
 | Dwell < 10 s (`OVP_PAUSE_MIN_TICKS = 5`) | Hold |
-| Dwell ≥ 10 s, no new advertisement since the pause | IPG dark (coil-powered): stored `VRECT_OVPn` is stale — log `IPG silent … in OVP pause, treating fault as cleared` and take the resume row below |
+| Dwell ≥ 10 s, no new advertisement for the last 10 s (`m_ovp_silent_ticks`) | IPG dark (coil-powered): stored `VRECT_OVPn` is stale — log `IPG silent … in OVP pause, treating fault as cleared` and take the resume row below |
 | Dwell ≥ 10 s, `VRECT_OVPn` still 0 | Hold, log at WARNING |
 | Dwell ≥ 10 s, `VRECT_OVPn` cleared | Step level down one, set `m_blank_cycles`, `WPT_FAULT_RESUME(PAUSE_OVP)` |
 
@@ -1139,6 +1153,33 @@ Release builds compile the function out, so a production charger keeps its debug
 - *A fault could escape the record.* The task name was read from the kernel's task control block before the record was committed. If the fault came from memory corruption, that block can itself be corrupt, and faulting again inside a fault handler locks the core up — no record, and with a debugger attached possibly a halt. The record is now committed first, from the fault's own data, and the name is read afterwards, only if the block lies in RAM (a name that still fails to read just leaves it blank). The stack-overflow hook checks its name pointer the same way.
 - *`ReportAtBoot()` depended on call order.* It read `NRF_POWER->RESETREAS` directly, which faults once the SoftDevice is enabled — a boot-time reset loop if `System::Init()` were ever reordered. It now uses `sd_power_reset_reason_get()` / `_clr()` when `nrf_sdh_is_enabled()`, and the register only while the SoftDevice is off.
 
+### 8.12 — 2026-09-18 Pause deadlock when the IPG goes dark late
+
+**Symptom.** A thermal pause at 46.86 °C with the IPG at BattB 3.1 V never retried. RTT repeated the same reading — 44.82 °C, `ref=2350 out=1500 ofst=770` — every 2 s for over 11 minutes, and the scope showed no attempt at power.
+
+**Cause.** The §8.8 blind retry fired only if *no* advertisement had arrived since the pause began. This time the IPG kept advertising on its battery after the coil stopped — 14 advertisements, still hot — and then went dark. Because the count had moved since the pause, the code treated the IPG as alive and waited for it to cool, but the last reading was frozen and could never improve. The OVP pause had the same test and the same failure: one late advertisement still showing `VRECT_OVPn=0` would have held it paused forever.
+
+**Fix** (`svc_wpt_manager.{h,cpp}`). Both pauses now measure silence from the *last* advertisement:
+
+| Pause | Before | After |
+|-------|--------|-------|
+| Thermal | Retry only if the count is unchanged since the pause; backoff measured from the pause | Retry once `m_thermal_silent_ticks` ≥ 30 s; backoff (30/60/120/240 s) measured in silence |
+| OVP | Treat as cleared only if the count is unchanged since the pause | Treat as cleared once `m_ovp_silent_ticks` ≥ `OVP_PAUSE_MIN_TICKS` (10 s) |
+
+`m_thermal_pause_adv_count` and `m_ovp_pause_adv_count` are replaced by `m_thermal_last_adv_count`, `m_thermal_silent_ticks` and `m_ovp_silent_ticks`. If no advertisement arrives at all after the pause, silence equals time paused, so behaviour in the original §8.8 case is unchanged.
+
+**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not hardware-tested.
+
+### 8.13 — 2026-09-18 IPG lost while charging normally: the level froze
+
+**Symptom.** With the §8.12 build: a session found a drained IPG (BattB 3.1 V, advertising on its battery), the cold-start ramp stopped at level 1, and the control loop stepped up to level 2 on PGOOD = 0. Within ~10 s the IPG stopped advertising. For the next ~5 minutes the log showed `Power control skipped, no new IPG advertisement since last step` every cycle and the scope showed an unchanging sub-threshold waveform.
+
+**Cause.** Nothing could raise the level. The control loop refuses to act without fresh telemetry, which is right for a single stale cycle and wrong for sustained silence. The cold-start ramp only runs until a session's first advertisement, the blind retry only runs inside a fault pause, and `StateCharge` answers a BLE timeout by rescanning. The same deadlock shape as §8.12, in the one state with no fallback.
+
+**Fix.** The silent-IPG ramp in `PowerControlMonitoring()` / new `SilentRampStep()` (§6.3): after 30 s of silence with no fault pending, step up one level open-loop per 30 s until the IPG advertises, capped below any known OVP ceiling, ending the session if it is still silent at the cap. New `SILENT_RAMP_CYCLES`, `m_silent_cycles`, `m_silent_ramp_active`, all reset by `ResetPowerControl()`.
+
+**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not hardware-tested.
+
 ---
 
 ## 9. Event Flow — Complete Happy Path
@@ -1173,6 +1214,8 @@ Every 2 s (mFaultTimer): IpgOvpMonitoring() + IpgTemperatureMonitoring()
 
 Every 10 s (mPowerCtrlTimer): PowerControlMonitoring()
   → skipped while any fault is pending, blanked, or telemetry is stale
+  → IPG silent 30 s, no fault pending: +1 step open-loop per 30 s of silence;
+    still silent at the limit → WPT_SCAN_TIMEOUT ends the session
   → first cycle with telemetry: keep the current level, decide next cycle
   → PGOOD=1, floor not found: step down
   → PGOOD=1, floor found:     hold
@@ -1355,6 +1398,7 @@ LEVEL_INVALID                  = 0xFF     // sentinel: no bound observed yet
 LEVEL_REQUEST_MAX              = 0xFE     // out of range on purpose; HAL clamps (currently unused)
 PGOOD_LOW_CONFIRM              = 2        // consecutive PGOOD=0 cycles before stepping up
 BLANK_CYCLES_AFTER_FAULT       = 1        // control cycles skipped after a fault resume
+SILENT_RAMP_CYCLES             = 3        // silent control cycles (× 10 s) before each open-loop step up
 ```
 
 **`app_state_machine.cpp`** (local to `ProcessNewBleData()`):
