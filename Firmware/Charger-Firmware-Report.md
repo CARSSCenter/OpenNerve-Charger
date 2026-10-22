@@ -611,12 +611,25 @@ Three guards run before any rule is evaluated:
 ```cpp
 if (m_pause_reasons != 0)          return;   // fault path owns the level
 if (m_blank_cycles) { m_blank_cycles--; return; }
-if (adv_count == m_last_adv_count) return;   // stale telemetry, or cold start
+if (adv_count == m_last_adv_count) { ...; return; }   // stale telemetry - see the silent-IPG ramp below
 ```
 
 The first is what makes PGOOD interpretable at all. Because the control loop bails out whenever any fault is asserted, every PGOOD = 0 it actually observes has no fault behind it — so it unambiguously means "too little power," and stepping up is correct. Faults only ever step down, and only from the 2 s path. See §6.6 for why this separation is necessary rather than merely tidy.
 
-The third guard also cleanly gates the loop off during cold start, since the advertisement count stays at the session baseline recorded by `ResetPowerControl()` until the IPG answers. (Before 2026-09-17 the baseline was 0, so in every session after the first the previous session's last advertisement looked fresh.)
+The third guard compares against the session baseline recorded by `ResetPowerControl()`. (Before 2026-09-17 the baseline was 0, so in every session after the first the previous session's last advertisement looked fresh.) The loop never runs during cold start: every path that starts `mPowerCtrlTimer` stops the cold-start ramp first.
+
+#### Silent-IPG ramp (2026-09-18)
+
+A stale cycle is normally just a wait. Sustained silence is different: a drained IPG runs on coil power, so a level too low to sustain it cuts off the very telemetry the loop needs before it will raise the level, and the loop used to hold that level forever. Now, with no fault pause active:
+
+| Condition | Action |
+|-----------|--------|
+| 1–2 consecutive cycles with no new advertisement | Skip; logs `Power control skipped, no new IPG advertisement (n/3)` |
+| 3 cycles (`SILENT_RAMP_CYCLES`, 30 s) | Record the current level as insufficient (`m_pgood_floor`, `m_floor_found`), then step up one level open-loop. Repeats every further 30 s of silence |
+| Silent at the ramp limit for another 30 s | `IPG still silent at level L (ramp limit), ending charge session`; `WPT_SCAN_TIMEOUT` — same path as the thermal give-up |
+| Advertisement returns | Keep the level, decide from the next advertisement (the cold-start handover) |
+
+The ramp limit is `m_ovp_ceiling - 1` when an OVP ceiling is known, otherwise the maximum level; it never moves more than one step at a time. It stands aside while a fault pause is active (the pause's own blind retry or OVP hold owns silence there) and while a blind thermal retry is waiting on its probe. Because the lost level is recorded as the PGOOD floor, the loop will afterwards hold or climb but not walk back down into it; a thermal trip still re-arms the downward search.
 
 #### Floor, ceiling, and the empty window
 
@@ -645,6 +658,7 @@ The loop now usually starts low and climbs: each step up needs two PGOOD = 0 cyc
 COLD_START_LEVEL          = 1    // of 0..12 — reset level and cold-start ramp start
 PGOOD_LOW_CONFIRM         = 2    // consecutive PGOOD=0 cycles before stepping up
 BLANK_CYCLES_AFTER_FAULT  = 1    // control cycles skipped after a fault resume
+SILENT_RAMP_CYCLES        = 3    // silent control cycles (30 s) before each open-loop step up
 MIN_POWER_LEVEL           = 0
 MAX_VOLTAGE_STEP          = 12   // maximum DAC step (from the HAL)
 ```
@@ -678,7 +692,7 @@ This loop acts on the **IPG's** temperature, broadcast over BLE — not the char
 | Paused, dwell < 30 s | Hold — no resume regardless of temperature |
 | Paused, dwell ≥ 30 s, temp > 39 °C (`IPG_TEMP_THRESHOLD_RESUME`) | Hold — keep waiting |
 | Paused, dwell ≥ 30 s **and** temp ≤ 39 °C | `WPT_FAULT_RESUME(PAUSE_THERMAL)` — coil re-enabled |
-| Paused, temp > 39 °C, **no new advertisement since the pause** | Blind retry after 30 / 60 / 120 / 240 s — see below |
+| Paused, temp > 39 °C, **no new advertisement for 30 s** (the IPG has gone quiet) | Blind retry after 30 / 60 / 120 / 240 s — see below |
 
 The dwell is counted in fault-timer ticks (`THERMAL_PAUSE_MIN_TICKS = 15` × 2 s). Both conditions are required: the dwell alone would allow re-enabling into an implant still sitting at the limit, producing a power-burst cycle rather than a controlled hold, while the threshold alone gave no guaranteed cool-down time.
 
@@ -703,11 +717,11 @@ Because every wrap is caught by construction, no debounce is needed: a single *p
 
 **Blind thermal retry — coil-powered IPG (2026-09-17).** Below ~3.2 V the IPG has no usable battery and runs directly from the rectified coil voltage. A thermal pause turns the coil off, the IPG shuts down, and no new advertisement can ever arrive; the stored reading is the one that caused the pause, so the resume branch above was unreachable and the charger sat paused until a button press (seen on hardware: 48.47 °C, then 0 advertisements). The 48 °C reading is treated as genuine throughout.
 
-"The IPG is dark" is decided from the advertisement counter, not the battery voltage (the last BattB is itself stale): `m_thermal_pause_adv_count` is recorded when the pause starts, and an unchanged count means nothing has been heard since. An IPG running on its battery keeps advertising while paused, never takes this path, and resumes only on a real ≤ 39 °C reading as before.
+"The IPG is dark" is decided from the advertisement counter, not the battery voltage (the last BattB is itself stale): `m_thermal_silent_ticks` counts fault ticks since the counter last changed, and resets to 0 on every new advertisement, implausible ones included. What matters is silence *now*, not whether anything arrived since the pause began: a drained IPG can keep advertising on its battery for a while after the coil stops and only then go dark, freezing a hot reading in place (§8.12). An IPG that keeps advertising while paused never builds up silence, never takes this path, and resumes only on a real ≤ 39 °C reading as before.
 
 | Step | Action |
 |------|--------|
-| Paused, dark, dwell ≥ `THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count` (30, 60, 120, 240 s) | Step down one level (unless the last retry failed for lack of an advertisement), clear `m_floor_found`, set `m_blank_cycles`, start a probe, `WPT_FAULT_RESUME(PAUSE_THERMAL)`. Logs `IPG silent for N ticks in thermal pause, blind retry k/4 at level L` |
+| Paused, dark, silence ≥ `THERMAL_BLIND_RETRY_BASE_TICKS << m_thermal_retry_count` (30, 60, 120, 240 s since the last advertisement) | Step down one level (unless the last retry failed for lack of an advertisement), clear `m_floor_found`, set `m_blank_cycles`, start a probe, `WPT_FAULT_RESUME(PAUSE_THERMAL)`. Logs `IPG silent for N ticks (M in thermal pause), blind retry k/4 at level L` |
 | Probe running, no new advertisement | The stale reading is ignored — it would otherwise re-pause on the next tick |
 | Probe running, no advertisement within 20 s (`THERMAL_PROBE_TIMEOUT_TICKS`) | Failed (`no advertisement`): the level was too low to boot the IPG. Re-pause and queue one step **up**, never above `m_thermal_trip_level` (the level that first tripped) |
 | Probe running, first fresh plausible reading **> 39 °C** | Failed (`still hot`): re-pause. The retry skipped the cool-down check, so the first real reading must meet the *resume* threshold, not just stay under 41 °C |
@@ -748,7 +762,7 @@ const bool chg2_ovp  = (p.GET_CHG2_OVP_ERR == 0);  // logged on change only
 | New advertisement, a `CHGx_OVP_ERRn` changed | Log it — WARNING on assert, INFO on clear, with level and PGOOD. Coil unaffected |
 | Same advertisement as last tick | Ignored — only fresh telemetry can report a new fault |
 | Dwell < 10 s (`OVP_PAUSE_MIN_TICKS = 5`) | Hold |
-| Dwell ≥ 10 s, no new advertisement since the pause | IPG dark (coil-powered): stored `VRECT_OVPn` is stale — log `IPG silent … in OVP pause, treating fault as cleared` and take the resume row below |
+| Dwell ≥ 10 s, no new advertisement for the last 10 s (`m_ovp_silent_ticks`) | IPG dark (coil-powered): stored `VRECT_OVPn` is stale — log `IPG silent … in OVP pause, treating fault as cleared` and take the resume row below |
 | Dwell ≥ 10 s, `VRECT_OVPn` still 0 | Hold, log at WARNING |
 | Dwell ≥ 10 s, `VRECT_OVPn` cleared | Step level down one, set `m_blank_cycles`, `WPT_FAULT_RESUME(PAUSE_OVP)` |
 
@@ -1075,6 +1089,99 @@ This also resolves the §11 note about `state_slow_charge_and_scan.cpp:29` ("a l
 
 **Status.** Syntax-checked (no errors in first-party code). Not hardware-tested.
 
+### 8.10 — 2026-09-17 Crash instrumentation: faults reset and report instead of halting
+
+**Symptom.** The charger dies mid-session. RTT stops on an ordinary line, Button 1 and Button 2 do nothing, unplugging the bench supply does not help, and only re-flashing brings it back. It has happened while charging, in manual mode with the coil off, and while completely idle with nothing but the 5 s heartbeat running (`charger-20260917-092302.log`); one instance coincided with physically moving the transmit coil. No fault text, no assert text and no reboot appears in any of the logs.
+
+**Why it looked like dead hardware.** This is a Debug build (`DEBUG` and `DEBUG_NRF`), and every SDK fault path — `APP_ERROR_CHECK`, `ASSERT`, `NRFX_ASSERT`, FreeRTOS `configASSERT`, and `HardFault_c_handler` — executes `NRF_BREAKPOINT_COND` before doing anything else. That macro is a breakpoint instruction whenever a debugger is attached, and the J-Link is attached for the whole session because it is what carries RTT. The core halts there; `app_error_fault_handler` would then have spun in `app_error_save_and_stop()` with interrupts disabled anyway. A halted core runs no interrupt handlers, which is why Button 2 — a GPIOTE ISR that calls `NVIC_SystemReset()` — stops working, and why only re-flashing recovers: re-flashing ends with a debugger reset. Nothing about that behaviour depended on what the original fault was.
+
+**Changes.**
+
+| File | Change |
+|------|--------|
+| `src/service_layer/debug/svc_crash_record.{h,cpp}` | **New.** Strong overrides of `app_error_fault_handler`, `HardFault_Handler` and `vApplicationStackOverflowHook`. Each records what it knows — fault type, PC, LR, PSR, error code, file and line, `CFSR`/`HFSR`/`MMFAR`/`BFAR`, task name, heartbeat count — into a `.non_init` block and calls `NVIC_SystemReset()`. `ReportAtBoot()` prints the reset reason and any stored record; `LogStackHeadroom()` reports unused stack |
+| `src/project/config/sdk_config.h` | `NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED` 0 → **1**; `HARDFAULT_HANDLER_ENABLED` 1 → **0** (the SDK handler's Debug path breakpoints before any recorder could run) |
+| `external/freertos/config/FreeRTOSConfig.h` | `configCHECK_FOR_STACK_OVERFLOW` 0 → **2** |
+| `eda_manager.cpp` | `IdleHook()`'s `NRF_LOG_PROCESS()` is now behind `#if NRF_LOG_DEFERRED` |
+| `svc_wpt_manager.cpp` | Dropped the bare `LOG_FLUSH()` at the end of `FaultMonitoring()` |
+| `eda_active_object.{h,cpp}` | `InitTask()` records each task handle; `TaskCount()` / `TaskAt()` expose them for stack reporting |
+| `app_system.cpp` | `ReportAtBoot()` on startup; the heartbeat feeds `NoteHeartbeat()` and logs stack headroom once a minute |
+| `svc_debug_console.{h,cpp}` | Manual-mode keys `!` and `#` force an app error and a hard fault, to exercise the recorder |
+| `svc_debug_config.h` | New `CRASH_HALT_ON_FAULT` (default 0); set it to 1 to restore the halting behaviour for a real SES debug session |
+
+**Why a soft reset is the right response.** `NVIC_SystemReset()` leaves both the RAM contents and the debug connection intact — the logs show earlier resets mid-session with RTT streaming straight through (`charger-20260910-150842.log`). So the crash report arrives in the same RTT session a second later, and the charger carries on instead of waiting to be re-flashed.
+
+**The trigger is still open.** The strongest firmware suspect is the logger itself. Logging is in-place (`NRF_LOG_DEFERRED 0`), and while the write side (`buf_prealloc`) takes a critical region, the dequeue that every `LOG_*` call performs did not. Log calls come from six contexts — the WPT and PMC tasks, the timer daemon, the app task, the BLE task and the button GPIOTE ISR — at roughly 160 lines/s sustained. Interrupting a dequeue corrupts the read index and the memobj pool, which would produce exactly this: a fault with no message, because the logger is what broke. The critical-region change above closes that; a session at `NRF_LOG_DEFAULT_LEVEL 3` is the cheap way to test the same theory from the other side. The remaining candidates are a supply dip or EMI burst (the charger runs from 3×AA), and stack overflow, which was previously undetected.
+
+**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states (54 first-party files, 0 errors, only the pre-existing NULL-conversion warnings). Not hardware-tested.
+
+### 8.11 — 2026-09-18 Debug port re-locking on revision-3 silicon: the real "only a re-flash fixes it"
+
+**Symptom.** After unplugging everything overnight and plugging back in, the charger showed no RTT output and no coil output on a button press. JLinkExe's connect log contained:
+
+```
+InitTarget() start
+Device will be unsecured now.
+```
+
+**Cause.** That message means SEGGER's nRF52 connect script found the debug port locked and unlocked it the only way it can — a CTRL-AP `ERASEALL`, which wipes flash, RAM and UICR. Reading `0x00027000` afterwards returned `FFFFFFFF`: the application was gone.
+
+The board's nRF52840 is revision 3 (`FICR.INFO.VARIANT` = `0x41414630`, "AAF0"; `0x10000130/134` = `0x08`/`0x05`). On that silicon the access-port protection re-arms after every reset unless firmware opens it again at each boot. The vendored MDK (8.40.3) has the routine for this, `nrf52_handle_approtect()`, but only the generic `system_nrf52.c` calls it; the project compiles `system_nrf52840.c`, which never does. So:
+
+1. Any reset the debugger did not start — power-on, brown-out, pin reset — locked the debug port. RTT went silent, though the firmware itself may still have been running.
+2. The next J-Link connection "unsecured" the chip, erasing it.
+3. Only then was the board genuinely dead, until re-flashed.
+
+This accounts for much of what §8.10 attributed to crashes: no fault text in any of the hangs, the header-only reconnect logs before every recovery, and power cycling never helping. Soft resets with the debugger attached (Button 2 mid-session) did not re-lock the port, which is why those kept RTT streaming.
+
+**Fix.** `keep_debug_port_open()` in `src/main.cpp`, the first call in `main()`, Debug builds only:
+
+| Step | When |
+|------|------|
+| Skip entirely unless `nrf52_errata_249()` (the SDK's revision check) is true | Every boot |
+| Write `UICR.APPROTECT = HwDisabled` (0x5A) through the NVMC, then reset — only while the register still reads erased, since UICR bits cannot return to 1 without an erase and a locked value would otherwise reset forever | Once after each flash |
+| Write `NRF_APPROTECT->DISABLE = SwDisable` (0x5A) | Every boot |
+
+Release builds compile the function out, so a production charger keeps its debug port locked (see §11).
+
+**Status.** Hardware-verified 2026-09-18: after a full unplug and replug, JLinkExe connected with no "unsecured" line (`InitTarget()` 2.27 ms, against 223 ms when it was erasing), the firmware had been running on its own before the debugger attached, and the boot line read `reset reason 0x00000000: POWER-ON or BROWN-OUT`.
+
+**Also changed.** The boot line now lists every `RESETREAS` bit rather than the first. The register accumulates until cleared, and the first boot of the §8.10 build reported `0x0000000C` as "software reset", hiding a CPU-lockup bit (bit 3) that had been set at some earlier point.
+
+**Recorder hardening (same day).** Two weaknesses found on review of `svc_crash_record.cpp`:
+
+- *A fault could escape the record.* The task name was read from the kernel's task control block before the record was committed. If the fault came from memory corruption, that block can itself be corrupt, and faulting again inside a fault handler locks the core up — no record, and with a debugger attached possibly a halt. The record is now committed first, from the fault's own data, and the name is read afterwards, only if the block lies in RAM (a name that still fails to read just leaves it blank). The stack-overflow hook checks its name pointer the same way.
+- *`ReportAtBoot()` depended on call order.* It read `NRF_POWER->RESETREAS` directly, which faults once the SoftDevice is enabled — a boot-time reset loop if `System::Init()` were ever reordered. It now uses `sd_power_reset_reason_get()` / `_clr()` when `nrf_sdh_is_enabled()`, and the register only while the SoftDevice is off.
+
+### 8.12 — 2026-09-18 Pause deadlock when the IPG goes dark late
+
+**Symptom.** A thermal pause at 46.86 °C with the IPG at BattB 3.1 V never retried. RTT repeated the same reading — 44.82 °C, `ref=2350 out=1500 ofst=770` — every 2 s for over 11 minutes, and the scope showed no attempt at power.
+
+**Cause.** The §8.8 blind retry fired only if *no* advertisement had arrived since the pause began. This time the IPG kept advertising on its battery after the coil stopped — 14 advertisements, still hot — and then went dark. Because the count had moved since the pause, the code treated the IPG as alive and waited for it to cool, but the last reading was frozen and could never improve. The OVP pause had the same test and the same failure: one late advertisement still showing `VRECT_OVPn=0` would have held it paused forever.
+
+**Fix** (`svc_wpt_manager.{h,cpp}`). Both pauses now measure silence from the *last* advertisement:
+
+| Pause | Before | After |
+|-------|--------|-------|
+| Thermal | Retry only if the count is unchanged since the pause; backoff measured from the pause | Retry once `m_thermal_silent_ticks` ≥ 30 s; backoff (30/60/120/240 s) measured in silence |
+| OVP | Treat as cleared only if the count is unchanged since the pause | Treat as cleared once `m_ovp_silent_ticks` ≥ `OVP_PAUSE_MIN_TICKS` (10 s) |
+
+`m_thermal_pause_adv_count` and `m_ovp_pause_adv_count` are replaced by `m_thermal_last_adv_count`, `m_thermal_silent_ticks` and `m_ovp_silent_ticks`. If no advertisement arrives at all after the pause, silence equals time paused, so behaviour in the original §8.8 case is unchanged.
+
+**Status.** Bench-verified 2026-09-18 (~9.5 min session, drained IPG at BattB 3.1 V, seven thermal pauses). In every pause the IPG went quiet and the blind retry fired after exactly 15 silent ticks, one level lower; four retries were confirmed by a fresh ≤ 39 °C reading. One retry got no advertisement, re-paused and queued one step up, and the next fired after 30 silent ticks (the 60 s backoff) and was confirmed. A pause in which the IPG kept advertising resumed normally on a real 38.35 °C reading. The OVP half of the change was not exercised: no OVP pause occurred.
+
+### 8.13 — 2026-09-18 IPG lost while charging normally: the level froze
+
+**Symptom.** With the §8.12 build: a session found a drained IPG (BattB 3.1 V, advertising on its battery), the cold-start ramp stopped at level 1, and the control loop stepped up to level 2 on PGOOD = 0. Within ~10 s the IPG stopped advertising. For the next ~5 minutes the log showed `Power control skipped, no new IPG advertisement since last step` every cycle and the scope showed an unchanging sub-threshold waveform.
+
+**Cause.** Nothing could raise the level. The control loop refuses to act without fresh telemetry, which is right for a single stale cycle and wrong for sustained silence. The cold-start ramp only runs until a session's first advertisement, the blind retry only runs inside a fault pause, and `StateCharge` answers a BLE timeout by rescanning. The same deadlock shape as §8.12, in the one state with no fallback.
+
+**Fix.** The silent-IPG ramp in `PowerControlMonitoring()` / new `SilentRampStep()` (§6.3): after 30 s of silence with no fault pending, step up one level open-loop per 30 s until the IPG advertises, capped below any known OVP ceiling, ending the session if it is still silent at the cap. New `SILENT_RAMP_CYCLES`, `m_silent_cycles`, `m_silent_ramp_active`, all reset by `ResetPowerControl()`.
+
+**Status.** Compiles clean in both `WPT_MANUAL_DEBUG_MODE` states. Not yet exercised on hardware: in the 2026-09-18 bench session (§8.12) the IPG never went quiet outside a fault pause, so the ramp never engaged. Exercising it needs the IPG to drop out during normal charging, as in the level 1 → 2 case above.
+
+---
+
 ## 9. Event Flow — Complete Happy Path
 
 ### 9.1 IPG already advertising (awake)
@@ -1107,6 +1214,8 @@ Every 2 s (mFaultTimer): IpgOvpMonitoring() + IpgTemperatureMonitoring()
 
 Every 10 s (mPowerCtrlTimer): PowerControlMonitoring()
   → skipped while any fault is pending, blanked, or telemetry is stale
+  → IPG silent 30 s, no fault pending: +1 step open-loop per 30 s of silence;
+    still silent at the limit → WPT_SCAN_TIMEOUT ends the session
   → first cycle with telemetry: keep the current level, decide next cycle
   → PGOOD=1, floor not found: step down
   → PGOOD=1, floor found:     hold
@@ -1214,6 +1323,42 @@ Operator presses 'n'
                          timers, WPT_POWER_OFF, STOP_SCANNING, PMC_POWER_OFF, LED off
 ```
 
+### 9.4 Hang and crash triage
+
+With the instrumented build (§8.10), a fault should no longer strand the board:
+
+```
+Fault (assert, APP_ERROR_CHECK, hard fault, stack overflow)
+  → svc_crash_record: fill the .non_init record, one best-effort log line
+  → NVIC_SystemReset()          ← the J-Link connection and RTT session survive this
+  → next boot, before the SoftDevice is enabled:
+      "Boot N: reset reason 0x00000004: SOFT-RESET"   (every set bit is listed)
+      "CRASH RECORD: <type> in task '<name>', <n> heartbeats into the run"
+      "  error <code> [<name>] at <file>:<line>"     (APP_ERROR_CHECK)
+      "  pc 0x... lr 0x... psr 0x..."
+      "  cfsr ... hfsr ... mmfar ... bfar ..."        (hard fault)
+  → the charger keeps running
+```
+
+**Check the mechanism first.** In manual mode, `!` forces an `APP_ERROR_CHECK` failure and `#` forces a hard fault. Each should reset the board and print a record naming `svc_debug_console.cpp`.
+
+**If a hang still happens with no reset**, the core is halted, locked up or unpowered — do not re-flash, because re-flashing destroys the evidence. Restart JLinkExe (`-device NRF52840_XXAA -if SWD -speed 4000 -autoconnect 1`) and capture:
+
+| Command | Reads |
+|---------|-------|
+| `mem32 0xE000EDF0 1` | DHCSR — bit 17 halted, bit 18 sleeping, bit 19 locked up |
+| `halt` then `regs` | PC, LR, SP and xPSR (its low 9 bits name the active exception) |
+| `mem32 0xE000ED28 1` | CFSR |
+| `mem32 0xE000ED2C 1` | HFSR |
+| `mem32 0xE000ED38 1` | BFAR |
+| `mem32 0x40000400 1` | RESETREAS |
+
+Map the addresses with `arm-none-eabi-addr2line -f -C -e <Output/.../hornet-wpt-charger.elf> <PC> <LR>`, or attach from SES (Debug → Attach Debugger, which neither resets nor downloads) and read the call stack. Then `r` and `g`: if the charger comes back, flash was never the problem and the earlier recoveries were just the debugger's reset.
+
+**Reconnecting is safe now — in Debug builds.** Before §8.11, reconnecting the J-Link after any reset erased the chip. If JLinkExe ever prints `Device will be unsecured now` again, the chip has just been erased: stop and find out why the debug port was locked (a Release build, or a Debug build that never reached `main()`).
+
+**Read the boot line after any unexpected silence.** `0x00000000: POWER-ON or BROWN-OUT` in the middle of a session means the supply dipped — a power problem, not firmware. `CPU-LOCKUP` means a fault occurred inside a fault handler; the record from the first fault should still be there. `WATCHDOG`, `PIN` and `SOFT-RESET` name themselves. An attached J-Link can back-power the nRF, so a genuine power cycle means supply off and the J-Link unplugged.
+
 ---
 
 ## 10. Constants Reference
@@ -1253,6 +1398,7 @@ LEVEL_INVALID                  = 0xFF     // sentinel: no bound observed yet
 LEVEL_REQUEST_MAX              = 0xFE     // out of range on purpose; HAL clamps (currently unused)
 PGOOD_LOW_CONFIRM              = 2        // consecutive PGOOD=0 cycles before stepping up
 BLANK_CYCLES_AFTER_FAULT       = 1        // control cycles skipped after a fault resume
+SILENT_RAMP_CYCLES             = 3        // silent control cycles (× 10 s) before each open-loop step up
 ```
 
 **`app_state_machine.cpp`** (local to `ProcessNewBleData()`):
@@ -1271,11 +1417,24 @@ NTC_R0                            = 5000     // Ω — local NTC at 25°C
 NTC_BETA                          = 3480
 ```
 
-**`svc_debug_config.h`** (debug console — see §4.7):
+**`svc_debug_config.h`** (debug console — see §4.7; fault handling — see §8.10):
 ```cpp
 WPT_MANUAL_DEBUG_MODE      = 0         // 1 = compile the console and StateManual in
 WPT_MANUAL_POLL_PERIOD_MS  = 100       // ms — RTT keystroke poll
 WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idle; 0 disables
+CRASH_HALT_ON_FAULT        = 0         // 1 = breakpoint before resetting, for SES debug sessions
+```
+
+**Fault and logging configuration** (§8.10) — easy to regress, and the symptom is a board that looks dead:
+```cpp
+// src/project/config/sdk_config.h
+NRF_LOG_DEFERRED                             = 0     // in-place: each log call formats and writes
+NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED = 1     // ...and must hold the lock while it does
+HARDFAULT_HANDLER_ENABLED                    = 0     // the SDK handler is replaced by svc_crash_record
+NRF_LOG_DEFAULT_LEVEL                        = 4     // DEBUG; level 3 cuts most of the ~160 lines/s
+
+// external/freertos/config/FreeRTOSConfig.h
+configCHECK_FOR_STACK_OVERFLOW               = 2     // pattern check at every context switch
 ```
 
 ---
@@ -1308,5 +1467,13 @@ WPT_MANUAL_DEADMAN_MS      = 600000    // ms — pause the coil after 10 min idl
 - **Pause during coil-powered charging is blind:** While a drained IPG is paused it cannot report temperature; the blind retry (§6.5) bounds the exposure but still re-enables the coil without a fresh reading. A keep-alive power level (§8.8) would remove the blind period if bench data shows it is thermally safe.
 
 - **Completion thresholds assume the current IPG:** `BATTERY_PRESENT_MV` / `BATTERY_FULL_MV` (§7) rely on the IPG's 100 mV battery encoding and the LTC4065's 4.2 V float. An IPG firmware that stops sending battery voltages (both channels < 1 V) would never end a session on its own.
+
+- **A silent hang is still possible, and nothing resets the board:** the crash recorder (§8.10) only covers faults the CPU actually raises. A deadlock, a stuck interrupt or a busy-wait that never ends produces no fault, so the board still stops with no record. There is no watchdog — `NRFX_WDT_ENABLED` is 0 — and enabling one (paused while the debugger halts the core, fed from the heartbeat) would turn that last class of hang into a reset with `RESETREAS = DOG`.
+
+- **ISR-safe kernel calls are made from task context:** the WPT timer callbacks (`StatusTimeoutMonitoring`, `IpgTemperatureMonitoring`, `IpgOvpMonitoring`, `FailThermalProbe`) and `SetPowerLevel()` reach `Port::SendEventFromISR()`, which calls `xQueueSendFromISR` and `portYIELD_FROM_ISR` — but they run on the timer daemon task, not in an interrupt. It works today and the queue is protected either way, so this is hygiene rather than a defect. The related gap is that neither `SendEvent()` nor `SendEventFromISR()` checks its return value, so a full 20-deep queue drops events silently.
+
+- **Release builds lock the debug port — connecting a J-Link erases them:** on revision-3 nRF52840 silicon, `keep_debug_port_open()` (§8.11) runs in Debug builds only. That is deliberate for a production device, but it means attaching a J-Link to a Release unit for RTT will erase it. Conversely, a Debug build leaves `UICR.APPROTECT` open until the chip is erased, so a Debug build must never ship.
+
+- **No thermal ceiling for the closed loop:** an OVP trip records `m_ovp_ceiling` and the loop never climbs back to it, but a thermal trip records nothing the loop respects (`m_thermal_trip_level` only bounds the blind retry's own step-ups). If PGOOD stays low below the level that overheats, the loop climbs back to it after each confirmed retry, giving a repeating pause / retry / climb cycle. Seen on the bench 2026-09-18: seven thermal pauses in ~9.5 min at levels 4–6 with PGOOD = 0 throughout (§8.12). Options if needed: a thermal ceiling analogous to the OVP one, or ending the session when PGOOD cannot be reached below the trip level.
 
 - **`WptManager::RearmPowerSearch()` has no callers** (§6.2) — kept deliberately, but dead code today.

@@ -99,6 +99,26 @@ namespace eda
         void SendEventFromISR(Port &port, uint32_t eventId, uint32_t optDataAddress);
 
         /**
+         * @brief Number of active objects whose task has been created
+         *
+         * Every InitTask() records its handle, so diagnostics can walk the tasks
+         * without the kernel's trace facility (configUSE_TRACE_FACILITY is off).
+         */
+        static uint8_t TaskCount();
+
+        /**
+         * @brief Handle of the index'th created task, or NULL if out of range
+         *
+         * @param index Task index, 0 .. TaskCount() - 1
+         */
+        static TaskHandle_t TaskAt(uint8_t index);
+
+        /**
+         * @brief Upper bound on the handles kept for TaskAt()
+         */
+        static constexpr uint8_t max_tracked_tasks = 8U;
+
+        /**
          * @brief Handle of a task
          */
         xTaskHandle mTaskHandle;

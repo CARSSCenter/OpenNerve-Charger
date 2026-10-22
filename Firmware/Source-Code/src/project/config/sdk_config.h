@@ -6921,7 +6921,7 @@
 
 
 #ifndef HARDFAULT_HANDLER_ENABLED
-#define HARDFAULT_HANDLER_ENABLED 1
+#define HARDFAULT_HANDLER_ENABLED 0
 #endif
 
 // <e> HCI_MEM_POOL_ENABLED - hci_mem_pool - memory pool implementation used by HCI
@@ -7975,7 +7975,7 @@
 // <i> but system will spend significant amount of time in critical section
 
 #ifndef NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED
-#define NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED 0
+#define NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED 1
 #endif
 
 // <o> NRF_LOG_STR_PUSH_BUFFER_SIZE  - Size of the buffer dedicated for strings stored using @ref NRF_LOG_PUSH.

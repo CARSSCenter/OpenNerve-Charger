@@ -101,11 +101,16 @@ namespace eda
 
     void Manager::IdleHook()
     {
-        #if LOG_ENABLED
-        static bool logs_remaining = true;
-        while (logs_remaining)
+        // Only deferred logging needs draining here. In in-place mode (the current
+        // build) every LOG_* call already formats and writes the message in the
+        // caller's context, and NRF_LOG_PROCESS() would be a second, *unlocked*
+        // dequeue racing the one inside those calls - which is protected by
+        // NRF_LOG_NON_DEFFERED_CRITICAL_REGION_ENABLED. The old code was also inert
+        // after the first pass: its static flag latched false on the first empty
+        // buffer and was never set again.
+        #if LOG_ENABLED && NRF_LOG_DEFERRED
+        while (NRF_LOG_PROCESS())
         {
-            logs_remaining = NRF_LOG_PROCESS();
         }
         #endif
     }
