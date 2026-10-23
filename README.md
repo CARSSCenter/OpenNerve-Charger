@@ -21,12 +21,13 @@ The left LED shows the current state:
     Blue → SCAN
     White → SLOW_CHARGE_AND_SCAN 
     Yellow → CHARGE (connected and charging)
+    Magenta → MANUAL (debug builds only, entered from the RTT console)
 
 The middle LED turns Green when charging is complete.
 
 Below is a more detailed summary of the firmware state machine, main transitions, and LEDs colors:
 
-States: INITIALIZATION, WAIT, SCAN, SLOW_CHARGE_AND_SCAN, CHARGE
+States: INITIALIZATION, WAIT, SCAN, SLOW_CHARGE_AND_SCAN, CHARGE (plus MANUAL when built with WPT_MANUAL_DEBUG_MODE = 1)
 
 Note: BTN2 (MCU reset) is available in all states and bypasses the state machine entirely. Pressing BTN2 disables WPT and the VCC regulator, then immediately resets the MCU. The device boots back to WAIT.
 
@@ -61,13 +62,14 @@ STATE: CHARGE (Yellow Left LED ON / middle LED Green when complete)
 
     CHARGE_COMPLETE → WAIT (middle LED Green ON)
     BTN1 PRESSED → WAIT (stop charge)
-    WPT_SCAN_TIMEOUT → WAIT
-    TEMPERATURE_CRITICAL (IPG ≥ 41°C) → WAIT (thermal protection)
+    WPT_SCAN_TIMEOUT (IPG lost) → WAIT
+    BLE_SCAN_TIMEOUT → restart scanning (stays in CHARGE)
+    IPG ≥ 41°C → coil paused (stays in CHARGE); resumes once IPG ≤ 39°C for at least 30 s
     BTN2 PRESSED → MCU RESET
     BUTTON_DFU_PRESSED (BTN3) → DFU mode
 
 In summary, after the charger is connected and initialization finishes, the device enters the WAIT state. If BTN1 is pressed, the device enters SCAN mode and the left LED turns blue. If a device is found, the charger transitions to CHARGE and the left LED turns yellow. If no device is found, the charger enters SLOW_CHARGE_AND_SCAN and the left LED turns white. If the device is still not found after that period, the system returns to WAIT (all LEDs off).
-If a device is found during the slow scan, the system transitions to CHARGE. Once charging is completed, the middle LED turns green and the system returns to WAIT. During charging, if BTN1 is pressed, the device returns to the WAIT state. Charging also stops automatically if the IPG temperature rise above 41°C (thermal protection) or if the WPT status times out.
+If a device is found during the slow scan, the system transitions to CHARGE. Once charging is completed, the middle LED turns green and the system returns to WAIT. During charging, if BTN1 is pressed, the device returns to the WAIT state. If the IPG temperature reaches 41°C, power transfer is paused (the charger stays in CHARGE) and resumes once the IPG has cooled to 39°C or below. Charging stops automatically if the IPG is lost (it stays silent even after the charger raises power to try to reach it).
 If the firmware becomes unresponsive at any point, BTN2 can be used to reset the MCU and return to WAIT without disconnecting power.
 
 ## Instructions for Firmware Development and Flashing
@@ -79,10 +81,10 @@ Instructions on how to set up the development environment and compile firmware c
 4. Click Erase Chip to remove previous FW.
 5. Download the two hex files from the Firmware folder.
 6. Flash the SoftDevice:
-    * Click the “…” button and select 140_nrf52_7.2.0_softdevice.hex 
+    * Click the “…” button and select s140_nrf52_7.2.0_softdevice.hex 
     * Click Program Device
 7. Flash the application:
-    * Click the “…” button and select wpt-charger.hex 
+    * Click the “…” button and select the most recent hornet-wpt-charger_Debug_*.hex 
     * Click Program Device
       
 ## Contributors
